@@ -13,7 +13,7 @@ use crate::{
     auth,
     db::{
         models::{
-            Collection, CollectionGroup, CollectionUser, EventType, Group, GroupId, GroupUser, Invitation,
+            Collection, CollectionGroup, CollectionId, CollectionUser, EventType, Group, GroupId, GroupUser, Invitation,
             Membership, MembershipId, MembershipStatus, MembershipType, Organization, OrganizationApiKey,
             OrganizationId, User, UserId,
         },
@@ -41,6 +41,11 @@ pub fn routes() -> Vec<Route> {
         public_post_members_invite,
         public_put_member,
         public_delete_member,
+        public_get_collections,
+        public_get_collection,
+        public_post_collection,
+        public_put_collection,
+        public_delete_collection,
     ]
 }
 
@@ -228,7 +233,7 @@ struct PublicGroupRequest {
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PublicCollectionData {
-    id: crate::db::models::CollectionId,
+    id: CollectionId,
     read_only: bool,
     hide_passwords: bool,
     manage: bool,
@@ -253,6 +258,33 @@ struct PublicEditUserData {
     groups: Option<Vec<GroupId>>,
     #[serde(default)]
     permissions: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PublicCollectionRequest {
+    name: String,
+    external_id: Option<String>,
+    groups: Vec<PublicCollectionGroupData>,
+    users: Vec<PublicCollectionMembershipData>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PublicCollectionGroupData {
+    id: GroupId,
+    read_only: bool,
+    hide_passwords: bool,
+    manage: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PublicCollectionMembershipData {
+    id: MembershipId,
+    read_only: bool,
+    hide_passwords: bool,
+    manage: bool,
 }
 
 #[derive(FromForm)]
@@ -820,4 +852,162 @@ async fn public_delete_member(member_id: MembershipId, token: PublicToken, conn:
     .await;
 
     member_to_delete.delete(&conn).await
+}
+
+// Public API Collection Endpoints
+#[get("/public/collections")]
+async fn public_get_collections(token: PublicToken, conn: DbConn) -> JsonResult {
+    let org_id = token.0;
+    let collections: Vec<serde_json::Value> = Collection::find_by_organization(&org_id, &conn)
+        .await
+        .iter()
+        .map(|c| c.to_json())
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "data": collections,
+        "object": "list",
+        "continuationToken": null,
+    })))
+}
+
+#[get("/public/collections/<collection_id>")]
+async fn public_get_collection(collection_id: CollectionId, token: PublicToken, conn: DbConn) -> JsonResult {
+    let org_id = token.0;
+    let Some(collection) = Collection::find_by_uuid_and_org(&collection_id, &org_id, &conn).await else {
+        err!("Collection not found", "Collection uuid is invalid or does not belong to the organization")
+    };
+
+    Ok(Json(collection.to_json()))
+}
+
+#[post("/public/collections", data = "<data>")]
+async fn public_post_collection(data: Json<PublicCollectionRequest>, token: PublicToken, conn: DbConn) -> JsonResult {
+    let org_id = token.0;
+    let data: PublicCollectionRequest = data.into_inner();
+
+    let Some(org) = Organization::find_by_uuid(&org_id, &conn).await else {
+        err!("Can't find organization details")
+    };
+
+    let collection = Collection::new(org.uuid, data.name, data.external_id);
+    collection.save(&conn).await?;
+
+    // Event logging
+    log_event(
+        EventType::CollectionCreated as i32,
+        &collection.uuid,
+        &org_id,
+        &UserId::from("00000000-0000-0000-0000-000000000000"),
+        0,
+        &std::net::IpAddr::from([0, 0, 0, 0]),
+        &conn,
+    )
+    .await;
+
+    // Add groups
+    for group in data.groups {
+        CollectionGroup::new(collection.uuid.clone(), group.id, group.read_only, group.hide_passwords, group.manage)
+            .save(&conn)
+            .await?;
+    }
+
+    // Add users
+    for user in data.users {
+        let Some(member) = Membership::find_by_uuid_and_org(&user.id, &org_id, &conn).await else {
+            err!("User is not part of organization")
+        };
+
+        if member.access_all {
+            continue;
+        }
+
+        CollectionUser::save(&member.user_uuid, &collection.uuid, user.read_only, user.hide_passwords, user.manage, &conn)
+            .await?;
+    }
+
+    // Return collection details (simplified, without user-specific details)
+    Ok(Json(collection.to_json()))
+}
+
+#[put("/public/collections/<collection_id>", data = "<data>")]
+async fn public_put_collection(
+    collection_id: CollectionId,
+    data: Json<PublicCollectionRequest>,
+    token: PublicToken,
+    conn: DbConn,
+) -> JsonResult {
+    let org_id = token.0;
+    let data: PublicCollectionRequest = data.into_inner();
+
+    if Organization::find_by_uuid(&org_id, &conn).await.is_none() {
+        err!("Can't find organization details")
+    };
+
+    let Some(mut collection) = Collection::find_by_uuid_and_org(&collection_id, &org_id, &conn).await else {
+        err!("Collection not found")
+    };
+
+    collection.name = data.name;
+    collection.set_external_id(data.external_id);
+    collection.save(&conn).await?;
+
+    // Event logging
+    log_event(
+        EventType::CollectionUpdated as i32,
+        &collection.uuid,
+        &org_id,
+        &UserId::from("00000000-0000-0000-0000-000000000000"),
+        0,
+        &std::net::IpAddr::from([0, 0, 0, 0]),
+        &conn,
+    )
+    .await;
+
+    // Update groups
+    CollectionGroup::delete_all_by_collection(&collection_id, &conn).await?;
+    for group in data.groups {
+        CollectionGroup::new(collection_id.clone(), group.id, group.read_only, group.hide_passwords, group.manage)
+            .save(&conn)
+            .await?;
+    }
+
+    // Update users
+    CollectionUser::delete_all_by_collection(&collection_id, &conn).await?;
+    for user in data.users {
+        let Some(member) = Membership::find_by_uuid_and_org(&user.id, &org_id, &conn).await else {
+            err!("User is not part of organization")
+        };
+
+        if member.access_all {
+            continue;
+        }
+
+        CollectionUser::save(&member.user_uuid, &collection_id, user.read_only, user.hide_passwords, user.manage, &conn)
+            .await?;
+    }
+
+    Ok(Json(collection.to_json()))
+}
+
+#[delete("/public/collections/<collection_id>")]
+async fn public_delete_collection(collection_id: CollectionId, token: PublicToken, conn: DbConn) -> EmptyResult {
+    let org_id = token.0;
+    let Some(collection) = Collection::find_by_uuid_and_org(&collection_id, &org_id, &conn).await else {
+        err!("Collection not found", "Collection does not exist or does not belong to this organization")
+    };
+
+    // Event logging
+    log_event(
+        EventType::CollectionDeleted as i32,
+        &collection.uuid,
+        &org_id,
+        &UserId::from("00000000-0000-0000-0000-000000000000"),
+        0,
+        &std::net::IpAddr::from([0, 0, 0, 0]),
+        &conn,
+    )
+    .await;
+
+    collection.delete(&conn).await
 }
