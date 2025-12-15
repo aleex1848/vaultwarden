@@ -1,27 +1,47 @@
 use chrono::Utc;
 use rocket::{
+    form::FromForm,
     request::{FromRequest, Outcome},
     serde::json::Json,
     Request, Route,
 };
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::{
-    api::EmptyResult,
+    api::{core::log_event, EmptyResult, JsonResult},
     auth,
     db::{
         models::{
-            Group, GroupUser, Invitation, Membership, MembershipStatus, MembershipType, Organization,
-            OrganizationApiKey, OrganizationId, User,
+            Collection, CollectionGroup, CollectionUser, EventType, Group, GroupId, GroupUser, Invitation,
+            Membership, MembershipId, MembershipStatus, MembershipType, Organization, OrganizationApiKey,
+            OrganizationId, User, UserId,
         },
         DbConn,
     },
-    mail, CONFIG,
+    mail,
+    util::NumberOrString,
+    CONFIG,
 };
 
 pub fn routes() -> Vec<Route> {
-    routes![ldap_import]
+    routes![
+        ldap_import,
+        public_get_groups,
+        public_get_groups_details,
+        public_get_group,
+        public_get_group_details,
+        public_post_group,
+        public_put_group,
+        public_delete_group,
+        public_get_group_members,
+        public_put_group_members,
+        public_get_members,
+        public_get_member,
+        public_post_members_invite,
+        public_put_member,
+        public_delete_member,
+    ]
 }
 
 #[derive(Deserialize)]
@@ -193,6 +213,56 @@ async fn ldap_import(data: Json<OrgImportData>, token: PublicToken, conn: DbConn
     Ok(())
 }
 
+// Structs for Public API requests
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PublicGroupRequest {
+    name: String,
+    #[serde(default)]
+    access_all: bool,
+    external_id: Option<String>,
+    collections: Vec<PublicCollectionData>,
+    users: Vec<MembershipId>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PublicCollectionData {
+    id: crate::db::models::CollectionId,
+    read_only: bool,
+    hide_passwords: bool,
+    manage: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PublicInviteData {
+    emails: Vec<String>,
+    groups: Vec<GroupId>,
+    r#type: NumberOrString,
+    collections: Option<Vec<PublicCollectionData>>,
+    #[serde(default)]
+    permissions: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PublicEditUserData {
+    r#type: NumberOrString,
+    collections: Option<Vec<PublicCollectionData>>,
+    groups: Option<Vec<GroupId>>,
+    #[serde(default)]
+    permissions: HashMap<String, serde_json::Value>,
+}
+
+#[derive(FromForm)]
+struct PublicGetOrgUserData {
+    #[field(name = "includeCollections")]
+    include_collections: Option<bool>,
+    #[field(name = "includeGroups")]
+    include_groups: Option<bool>,
+}
+
 pub struct PublicToken(OrganizationId);
 
 #[rocket::async_trait]
@@ -249,4 +319,505 @@ impl<'r> FromRequest<'r> for PublicToken {
 
         Outcome::Success(PublicToken(claims.client_sub))
     }
+}
+
+// Helper functions for Public API
+async fn public_get_groups_data(details: bool, org_id: OrganizationId, conn: &DbConn) -> JsonResult {
+    let groups: Vec<serde_json::Value> = if CONFIG.org_groups_enabled() {
+        let groups = Group::find_by_organization(&org_id, conn).await;
+        let mut groups_json = Vec::with_capacity(groups.len());
+
+        if details {
+            for g in groups {
+                groups_json.push(g.to_json_details(conn).await)
+            }
+        } else {
+            for g in groups {
+                groups_json.push(g.to_json())
+            }
+        }
+        groups_json
+    } else {
+        Vec::with_capacity(0)
+    };
+
+    Ok(Json(serde_json::json!({
+        "data": groups,
+        "object": "list",
+        "continuationToken": null,
+    })))
+}
+
+async fn public_add_update_group(
+    mut group: Group,
+    collections: Vec<PublicCollectionData>,
+    members: Vec<MembershipId>,
+    _org_id: OrganizationId,
+    conn: &DbConn,
+) -> JsonResult {
+    group.save(conn).await?;
+
+    for col_selection in collections {
+        let mut collection_group = CollectionGroup::new(
+            col_selection.id.clone(),
+            group.uuid.clone(),
+            col_selection.read_only,
+            col_selection.hide_passwords,
+            col_selection.manage,
+        );
+        collection_group.save(conn).await?;
+    }
+
+    for assigned_member in members {
+        let mut user_entry = GroupUser::new(group.uuid.clone(), assigned_member.clone());
+        user_entry.save(conn).await?;
+    }
+
+    Ok(Json(serde_json::json!({
+        "id": group.uuid,
+        "organizationId": group.organizations_uuid,
+        "name": group.name,
+        "accessAll": group.access_all,
+        "externalId": group.external_id,
+        "object": "group"
+    })))
+}
+
+// Public API Group Endpoints
+#[get("/public/groups")]
+async fn public_get_groups(token: PublicToken, conn: DbConn) -> JsonResult {
+    let org_id = token.0;
+    public_get_groups_data(false, org_id, &conn).await
+}
+
+#[get("/public/groups/details")]
+async fn public_get_groups_details(token: PublicToken, conn: DbConn) -> JsonResult {
+    let org_id = token.0;
+    public_get_groups_data(true, org_id, &conn).await
+}
+
+#[get("/public/groups/<group_id>")]
+async fn public_get_group(group_id: GroupId, token: PublicToken, conn: DbConn) -> JsonResult {
+    let org_id = token.0;
+    if !CONFIG.org_groups_enabled() {
+        err!("Group support is disabled");
+    }
+
+    let Some(group) = Group::find_by_uuid_and_org(&group_id, &org_id, &conn).await else {
+        err!("Group not found", "Group uuid is invalid or does not belong to the organization")
+    };
+
+    Ok(Json(group.to_json()))
+}
+
+#[get("/public/groups/<group_id>/details")]
+async fn public_get_group_details(group_id: GroupId, token: PublicToken, conn: DbConn) -> JsonResult {
+    let org_id = token.0;
+    if !CONFIG.org_groups_enabled() {
+        err!("Group support is disabled");
+    }
+
+    let Some(group) = Group::find_by_uuid_and_org(&group_id, &org_id, &conn).await else {
+        err!("Group not found", "Group uuid is invalid or does not belong to the organization")
+    };
+
+    Ok(Json(group.to_json_details(&conn).await))
+}
+
+#[post("/public/groups", data = "<data>")]
+async fn public_post_group(data: Json<PublicGroupRequest>, token: PublicToken, conn: DbConn) -> JsonResult {
+    let org_id = token.0;
+    if !CONFIG.org_groups_enabled() {
+        err!("Group support is disabled");
+    }
+
+    let group_request = data.into_inner();
+    let group = Group::new(org_id.clone(), group_request.name.clone(), group_request.access_all, group_request.external_id.clone());
+
+    // Note: Event logging without user context - using empty UserId for API calls
+    log_event(
+        EventType::GroupCreated as i32,
+        &group.uuid,
+        &org_id,
+        &UserId::from("00000000-0000-0000-0000-000000000000"),
+        0, // Device type 0 = API
+        &std::net::IpAddr::from([0, 0, 0, 0]),
+        &conn,
+    )
+    .await;
+
+    public_add_update_group(group, group_request.collections, group_request.users, org_id, &conn).await
+}
+
+#[put("/public/groups/<group_id>", data = "<data>")]
+async fn public_put_group(
+    group_id: GroupId,
+    data: Json<PublicGroupRequest>,
+    token: PublicToken,
+    conn: DbConn,
+) -> JsonResult {
+    let org_id = token.0;
+    if !CONFIG.org_groups_enabled() {
+        err!("Group support is disabled");
+    }
+
+    let Some(mut group) = Group::find_by_uuid_and_org(&group_id, &org_id, &conn).await else {
+        err!("Group not found", "Group uuid is invalid or does not belong to the organization")
+    };
+
+    let group_request = data.into_inner();
+    group.name.clone_from(&group_request.name);
+    group.access_all = group_request.access_all;
+
+    CollectionGroup::delete_all_by_group(&group_id, &conn).await?;
+    GroupUser::delete_all_by_group(&group_id, &conn).await?;
+
+    // Note: Event logging without user context
+    log_event(
+        EventType::GroupUpdated as i32,
+        &group.uuid,
+        &org_id,
+        &UserId::from("00000000-0000-0000-0000-000000000000"),
+        0,
+        &std::net::IpAddr::from([0, 0, 0, 0]),
+        &conn,
+    )
+    .await;
+
+    public_add_update_group(group, group_request.collections, group_request.users, org_id, &conn).await
+}
+
+#[delete("/public/groups/<group_id>")]
+async fn public_delete_group(group_id: GroupId, token: PublicToken, conn: DbConn) -> EmptyResult {
+    let org_id = token.0;
+    if !CONFIG.org_groups_enabled() {
+        err!("Group support is disabled");
+    }
+
+    let Some(group) = Group::find_by_uuid_and_org(&group_id, &org_id, &conn).await else {
+        err!("Group not found", "Group uuid is invalid or does not belong to the organization")
+    };
+
+    // Note: Event logging without user context
+    log_event(
+        EventType::GroupDeleted as i32,
+        &group.uuid,
+        &org_id,
+        &UserId::from("00000000-0000-0000-0000-000000000000"),
+        0,
+        &std::net::IpAddr::from([0, 0, 0, 0]),
+        &conn,
+    )
+    .await;
+
+    group.delete(&conn).await
+}
+
+#[get("/public/groups/<group_id>/users")]
+async fn public_get_group_members(group_id: GroupId, token: PublicToken, conn: DbConn) -> JsonResult {
+    let org_id = token.0;
+    if !CONFIG.org_groups_enabled() {
+        err!("Group support is disabled");
+    }
+
+    if Group::find_by_uuid_and_org(&group_id, &org_id, &conn).await.is_none() {
+        err!("Group could not be found!", "Group uuid is invalid or does not belong to the organization")
+    };
+
+    let group_members: Vec<MembershipId> = GroupUser::find_by_group(&group_id, &conn)
+        .await
+        .iter()
+        .map(|entry| entry.users_organizations_uuid.clone())
+        .collect();
+
+    Ok(Json(serde_json::json!(group_members)))
+}
+
+#[put("/public/groups/<group_id>/users", data = "<data>")]
+async fn public_put_group_members(
+    group_id: GroupId,
+    data: Json<Vec<MembershipId>>,
+    token: PublicToken,
+    conn: DbConn,
+) -> EmptyResult {
+    let org_id = token.0;
+    if !CONFIG.org_groups_enabled() {
+        err!("Group support is disabled");
+    }
+
+    if Group::find_by_uuid_and_org(&group_id, &org_id, &conn).await.is_none() {
+        err!("Group could not be found!", "Group uuid is invalid or does not belong to the organization")
+    };
+
+    GroupUser::delete_all_by_group(&group_id, &conn).await?;
+
+    let assigned_members = data.into_inner();
+    for assigned_member in assigned_members {
+        let mut user_entry = GroupUser::new(group_id.clone(), assigned_member.clone());
+        user_entry.save(&conn).await?;
+    }
+
+    Ok(())
+}
+
+// Public API Member Endpoints
+#[get("/public/members?<data..>")]
+async fn public_get_members(data: PublicGetOrgUserData, token: PublicToken, conn: DbConn) -> JsonResult {
+    let org_id = token.0;
+    let mut users_json = Vec::new();
+    for u in Membership::find_by_org(&org_id, &conn).await {
+        users_json.push(
+            u.to_json_user_details(
+                data.include_collections.unwrap_or(false),
+                data.include_groups.unwrap_or(false),
+                &conn,
+            )
+            .await,
+        );
+    }
+
+    Ok(Json(serde_json::json!({
+        "data": users_json,
+        "object": "list",
+        "continuationToken": null,
+    })))
+}
+
+#[get("/public/members/<member_id>?<data..>")]
+async fn public_get_member(
+    member_id: MembershipId,
+    data: PublicGetOrgUserData,
+    token: PublicToken,
+    conn: DbConn,
+) -> JsonResult {
+    let org_id = token.0;
+    let Some(user) = Membership::find_by_uuid_and_org(&member_id, &org_id, &conn).await else {
+        err!("The specified user isn't a member of the organization")
+    };
+
+    let include_groups = data.include_groups.unwrap_or(false);
+    Ok(Json(
+        user.to_json_user_details(data.include_collections.unwrap_or(include_groups), include_groups, &conn).await
+    ))
+}
+
+#[post("/public/members/invite", data = "<data>")]
+async fn public_post_members_invite(data: Json<PublicInviteData>, token: PublicToken, conn: DbConn) -> EmptyResult {
+    let org_id = token.0;
+    let data: PublicInviteData = data.into_inner();
+
+    let raw_type = &data.r#type.into_string();
+    let new_type = match MembershipType::from_str(raw_type) {
+        Some(new_type) => new_type as i32,
+        None => err!("Invalid type"),
+    };
+
+    let access_all = new_type >= MembershipType::Admin
+        || (raw_type.eq("4")
+            && data.permissions.get("editAnyCollection") == Some(&serde_json::json!(true))
+            && data.permissions.get("deleteAnyCollection") == Some(&serde_json::json!(true))
+            && data.permissions.get("createNewCollections") == Some(&serde_json::json!(true)));
+
+    let (org_name, org_email) = match Organization::find_by_uuid(&org_id, &conn).await {
+        Some(org) => (org.name, org.billing_email),
+        None => err!("Error looking up organization"),
+    };
+
+    let mut user_created: bool = false;
+    for email in data.emails.iter() {
+        let mut member_status = MembershipStatus::Invited as i32;
+        let user = match User::find_by_mail(email, &conn).await {
+            None => {
+                if !CONFIG.invitations_allowed() {
+                    err!(format!("User does not exist: {email}"))
+                }
+
+                if !CONFIG.is_email_domain_allowed(email) {
+                    err!("Email domain not eligible for invitations")
+                }
+
+                if !CONFIG.mail_enabled() {
+                    Invitation::new(email).save(&conn).await?;
+                }
+
+                let mut new_user = User::new(email, None);
+                new_user.save(&conn).await?;
+                user_created = true;
+                new_user
+            }
+            Some(user) => {
+                if Membership::find_by_user_and_org(&user.uuid, &org_id, &conn).await.is_some() {
+                    err!(format!("User already in organization: {email}"))
+                } else {
+                    if !CONFIG.mail_enabled() && !user.password_hash.is_empty() {
+                        member_status = MembershipStatus::Accepted as i32;
+                    }
+                    user
+                }
+            }
+        };
+
+        let mut new_member = Membership::new(user.uuid.clone(), org_id.clone(), Some(org_email.clone()));
+        new_member.access_all = access_all;
+        new_member.atype = new_type;
+        new_member.status = member_status;
+        new_member.save(&conn).await?;
+
+        if CONFIG.mail_enabled() {
+            if let Err(e) =
+                mail::send_invite(&user, org_id.clone(), new_member.uuid.clone(), &org_name, Some(org_email.clone())).await
+            {
+                if user_created {
+                    user.delete(&conn).await?;
+                } else {
+                    new_member.delete(&conn).await?;
+                }
+
+                err!(format!("Error sending invite: {e:?} "));
+            }
+        }
+
+        // Event logging
+        log_event(
+            EventType::OrganizationUserInvited as i32,
+            &new_member.uuid,
+            &org_id,
+            &UserId::from("00000000-0000-0000-0000-000000000000"),
+            0,
+            &std::net::IpAddr::from([0, 0, 0, 0]),
+            &conn,
+        )
+        .await;
+
+        // If no accessAll, add the collections received
+        if !access_all {
+            for col in data.collections.iter().flatten() {
+                match Collection::find_by_uuid_and_org(&col.id, &org_id, &conn).await {
+                    None => err!("Collection not found in Organization"),
+                    Some(collection) => {
+                        CollectionUser::save(
+                            &user.uuid,
+                            &collection.uuid,
+                            col.read_only,
+                            col.hide_passwords,
+                            col.manage,
+                            &conn,
+                        )
+                        .await?;
+                    }
+                }
+            }
+        }
+
+        for group_id in data.groups.iter() {
+            let mut group_entry = GroupUser::new(group_id.clone(), new_member.uuid.clone());
+            group_entry.save(&conn).await?;
+        }
+    }
+
+    Ok(())
+}
+
+#[put("/public/members/<member_id>", data = "<data>")]
+async fn public_put_member(
+    member_id: MembershipId,
+    data: Json<PublicEditUserData>,
+    token: PublicToken,
+    conn: DbConn,
+) -> EmptyResult {
+    let org_id = token.0;
+    let data: PublicEditUserData = data.into_inner();
+
+    let raw_type = &data.r#type.into_string();
+    let Some(new_type) = MembershipType::from_str(raw_type) else {
+        err!("Invalid type")
+    };
+
+    let access_all = new_type >= MembershipType::Admin
+        || (raw_type.eq("4")
+            && data.permissions.get("editAnyCollection") == Some(&serde_json::json!(true))
+            && data.permissions.get("deleteAnyCollection") == Some(&serde_json::json!(true))
+            && data.permissions.get("createNewCollections") == Some(&serde_json::json!(true)));
+
+    let mut member_to_edit = match Membership::find_by_uuid_and_org(&member_id, &org_id, &conn).await {
+        Some(member) => member,
+        None => err!("The specified user isn't member of the organization"),
+    };
+
+    member_to_edit.access_all = access_all;
+    member_to_edit.atype = new_type as i32;
+
+    // Delete all the old collections
+    for c in CollectionUser::find_by_organization_and_user_uuid(&org_id, &member_to_edit.user_uuid, &conn).await {
+        c.delete(&conn).await?;
+    }
+
+    // If no accessAll, add the collections received
+    if !access_all {
+        for col in data.collections.iter().flatten() {
+            match Collection::find_by_uuid_and_org(&col.id, &org_id, &conn).await {
+                None => err!("Collection not found in Organization"),
+                Some(collection) => {
+                    CollectionUser::save(
+                        &member_to_edit.user_uuid,
+                        &collection.uuid,
+                        col.read_only,
+                        col.hide_passwords,
+                        col.manage,
+                        &conn,
+                    )
+                    .await?;
+                }
+            }
+        }
+    }
+
+    GroupUser::delete_all_by_member(&member_to_edit.uuid, &conn).await?;
+
+    for group_id in data.groups.iter().flatten() {
+        let mut group_entry = GroupUser::new(group_id.clone(), member_to_edit.uuid.clone());
+        group_entry.save(&conn).await?;
+    }
+
+    // Event logging
+    log_event(
+        EventType::OrganizationUserUpdated as i32,
+        &member_to_edit.uuid,
+        &org_id,
+        &UserId::from("00000000-0000-0000-0000-000000000000"),
+        0,
+        &std::net::IpAddr::from([0, 0, 0, 0]),
+        &conn,
+    )
+    .await;
+
+    member_to_edit.save(&conn).await
+}
+
+#[delete("/public/members/<member_id>")]
+async fn public_delete_member(member_id: MembershipId, token: PublicToken, conn: DbConn) -> EmptyResult {
+    let org_id = token.0;
+    let Some(member_to_delete) = Membership::find_by_uuid_and_org(&member_id, &org_id, &conn).await else {
+        err!("User to delete isn't member of the organization")
+    };
+
+    if member_to_delete.atype == MembershipType::Owner && member_to_delete.status == MembershipStatus::Confirmed as i32 {
+        if Membership::count_confirmed_by_org_and_type(&org_id, MembershipType::Owner, &conn).await <= 1 {
+            err!("Can't delete the last owner")
+        }
+    }
+
+    // Event logging
+    log_event(
+        EventType::OrganizationUserRemoved as i32,
+        &member_to_delete.uuid,
+        &org_id,
+        &UserId::from("00000000-0000-0000-0000-000000000000"),
+        0,
+        &std::net::IpAddr::from([0, 0, 0, 0]),
+        &conn,
+    )
+    .await;
+
+    member_to_delete.delete(&conn).await
 }
