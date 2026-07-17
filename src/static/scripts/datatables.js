@@ -4,13 +4,13 @@
  *
  * To rebuild or modify this file with the latest versions of the included
  * software please visit:
- *   https://datatables.net/download/#bs5/dt-2.3.5
+ *   https://datatables.net/download/#bs5/dt-2.3.8
  *
  * Included libraries:
- *   DataTables 2.3.5
+ *   DataTables 2.3.8
  */
 
-/*! DataTables 2.3.5
+/*! DataTables 2.3.8
  * © SpryMedia Ltd - datatables.net/license
  */
 
@@ -186,7 +186,7 @@
 				"sDestroyWidth": $this[0].style.width,
 				"sInstance":     sId,
 				"sTableId":      sId,
-				colgroup: $('<colgroup>').prependTo(this),
+				colgroup: $('<colgroup>'),
 				fastData: function (row, column, type) {
 					return _fnGetCellData(oSettings, row, column, type);
 				}
@@ -259,6 +259,7 @@
 				"orderHandler",
 				"titleRow",
 				"typeDetect",
+				"columnTitleTag",
 				[ "iCookieDuration", "iStateDuration" ], // backwards compat
 				[ "oSearch", "oPreviousSearch" ],
 				[ "aoSearchCols", "aoPreSearchCols" ],
@@ -423,7 +424,7 @@
 			
 			if ( oSettings.caption ) {
 				if ( caption.length === 0 ) {
-					caption = $('<caption/>').appendTo( $this );
+					caption = $('<caption/>').prependTo( $this );
 				}
 			
 				caption.html( oSettings.caption );
@@ -434,6 +435,14 @@
 			if (caption.length) {
 				caption[0]._captionSide = caption.css('caption-side');
 				oSettings.captionNode = caption[0];
+			}
+			
+			// Place the colgroup element in the correct location for the HTML structure
+			if (caption.length) {
+				oSettings.colgroup.insertAfter(caption);
+			}
+			else {
+				oSettings.colgroup.prependTo(oSettings.nTable);
 			}
 			
 			if ( thead.length === 0 ) {
@@ -516,7 +525,7 @@
 		 *
 		 *  @type string
 		 */
-		builder: "bs5/dt-2.3.5",
+		builder: "bs5/dt-2.3.8",
 	
 		/**
 		 * Buttons. For use with the Buttons extension for DataTables. This is
@@ -1292,7 +1301,7 @@
 	};
 	
 	// Replaceable function in api.util
-	var _stripHtml = function (input) {
+	var _stripHtml = function (input, replacement) {
 		if (! input || typeof input !== 'string') {
 			return input;
 		}
@@ -1304,7 +1313,7 @@
 	
 		var previous;
 	
-		input = input.replace(_re_html, ''); // Complete tags
+		input = input.replace(_re_html, replacement || ''); // Complete tags
 	
 		// Safety for incomplete script tag - use do / while to ensure that
 		// we get all instances
@@ -1769,7 +1778,7 @@
 			}
 		},
 	
-		stripHtml: function (mixed) {
+		stripHtml: function (mixed, replacement) {
 			var type = typeof mixed;
 	
 			if (type === 'function') {
@@ -1777,7 +1786,7 @@
 				return;
 			}
 			else if (type === 'string') {
-				return _stripHtml(mixed);
+				return _stripHtml(mixed, replacement);
 			}
 			return mixed;
 		},
@@ -3379,7 +3388,7 @@
 						colspan++;
 					}
 	
-					var titleSpan = $('span.dt-column-title', cell);
+					var titleSpan = $('.dt-column-title', cell);
 	
 					structure[row][column] = {
 						cell: cell,
@@ -3597,6 +3606,11 @@
 	
 		if ( holdPosition !== true ) {
 			settings._iDisplayStart = 0;
+		}
+		else {
+			// Keep position, but make sure that there is actually data to display,
+			// otherwise we need to rewind a bit (e.g. if rows were deleted)
+			_fnLengthOverflow(settings);
 		}
 	
 		// Let any modules know about the draw hold position state (used by
@@ -4093,8 +4107,8 @@
 						}
 	
 						// Wrap the column title so we can write to it in future
-						if ( $('span.dt-column-title', cell).length === 0) {
-							$('<span>')
+						if ( $('.dt-column-title', cell).length === 0) {
+							$(document.createElement(settings.columnTitleTag))
 								.addClass('dt-column-title')
 								.append(cell.childNodes)
 								.appendTo(cell);
@@ -4105,9 +4119,9 @@
 							isHeader &&
 							jqCell.filter(':not([data-dt-order=disable])').length !== 0 &&
 							jqCell.parent(':not([data-dt-order=disable])').length !== 0 &&
-							$('span.dt-column-order', cell).length === 0
+							$('.dt-column-order', cell).length === 0
 						) {
-							$('<span>')
+							$(document.createElement(settings.columnTitleTag))
 								.addClass('dt-column-order')
 								.appendTo(cell);
 						}
@@ -4116,7 +4130,7 @@
 						// layout for those elements
 						var headerFooter = isHeader ? 'header' : 'footer';
 	
-						if ( $('span.dt-column-' + headerFooter, cell).length === 0) {
+						if ( $('div.dt-column-' + headerFooter, cell).length === 0) {
 							$('<div>')
 								.addClass('dt-column-' + headerFooter)
 								.append(cell.childNodes)
@@ -4273,6 +4287,10 @@
 		// Custom Ajax option to submit the parameters as a JSON string
 		if (baseAjax.submitAs === 'json' && typeof data === 'object') {
 			baseAjax.data = JSON.stringify(data);
+	
+			if (!baseAjax.contentType) {
+				baseAjax.contentType = 'application/json; charset=utf-8';
+			}
 		}
 	
 		if (typeof ajax === 'function') {
@@ -4907,6 +4925,12 @@
 	
 		var args = [settings, settings.json];
 	
+		// If the footer element is empty after initialisation, then remove it
+		let tfoot = $(settings.tfoot);
+		if (tfoot.children().length === 0) {
+			tfoot.remove();
+		}
+	
 		settings._bInitComplete = true;
 	
 		// Table is fully set up and we have data, so calculate the
@@ -5363,12 +5387,12 @@
 		// the content of the cell so that the width applied to the header and body
 		// both match, but we want to hide it completely.
 		$('th, td', headerCopy).each(function () {
-			$(this.childNodes).wrapAll('<div class="dt-scroll-sizing">');
+			$(this.childNodes).wrapAll('<div class="dt-scroll-sizing" />');
 		});
 	
 		if ( footer ) {
 			$('th, td', footerCopy).each(function () {
-				$(this.childNodes).wrapAll('<div class="dt-scroll-sizing">');
+				$(this.childNodes).wrapAll('<div class="dt-scroll-sizing" />');
 			});
 		}
 	
@@ -5395,6 +5419,10 @@
 	
 		// Correct DOM ordering for colgroup - comes before the thead
 		table.children('colgroup').prependTo(table);
+	
+		// Remove tabindex from the hidden row elements
+		table.find('thead, tfoot').find('[tabindex]').removeAttr('tabindex');
+		table.find('thead, tfoot').find('role').removeAttr('role');
 	
 		// Adjust the position of the header in case we loose the y-scrollbar
 		divBody.trigger('scroll');
@@ -5531,7 +5559,7 @@
 					var autoClass = _ext.type.className[column.sType];
 					var padding = column.sContentPadding || (scrollX ? '-' : '');
 					var text = longest + padding;
-					var insert = longest.indexOf('<') === -1
+					var insert = longest.indexOf('<') === -1 && longest.indexOf('&') === -1
 						? document.createTextNode(text)
 						: text
 	
@@ -5719,15 +5747,24 @@
 					.replace(/id=".*?"/g, '')
 					.replace(/name=".*?"/g, '');
 	
-				var s = _stripHtml(cellString)
+				// Don't want script, dialog or template tags in the width
+				// calculations as they are hidden content
+				cellString = cellString
+					.replace(/<script[\s\S]*?<\/script>/gi, ' ')
+					.replace(/<dialog[\s\S]*?<\/dialog>/gi, ' ')
+					.replace(/<template[\s\S]*?<\/template>/gi, ' ');
+	
+				var noHtml = _stripHtml(cellString, ' ')
 					.replace( /&nbsp;/g, ' ' );
 		
+				// The length is calculated on the text only, but we keep the HTML
+				// in the string so it can be used in the calculation table
 				collection.push({
-					str: s,
-					len: s.length
+					str: cellString,
+					len: noHtml.length
 				});
 	
-				allStrings.push(s);
+				allStrings.push(noHtml);
 			}
 	
 			// Order and then cut down to the size we need
@@ -8782,7 +8819,7 @@
 			// Automatic - find the _last_ unique cell from the top that is not empty (last for
 			// backwards compatibility)
 			for (var i=0 ; i<header.length ; i++) {
-				if (header[i][column].unique && $('span.dt-column-title', header[i][column].cell).text()) {
+				if (header[i][column].unique && $('.dt-column-title', header[i][column].cell).text()) {
 					target = i;
 				}
 			}
@@ -8875,6 +8912,10 @@
 						return columns.map( function (col, idx) {
 							// Not visible, can't match
 							if (! col.bVisible) {
+								return null;
+							}
+	
+							if (col.responsiveVisible === false) {
 								return null;
 							}
 	
@@ -9089,7 +9130,7 @@
 				title = undefined;
 			}
 	
-			var span = $('span.dt-column-title', this.column(column).header(row));
+			var span = $('.dt-column-title', this.column(column).header(row));
 	
 			if (title !== undefined) {
 				span.html(title);
@@ -10263,8 +10304,8 @@
 	
 	// Needed for header and footer, so pulled into its own function
 	function cleanHeader(node, className) {
-		$(node).find('span.dt-column-order').remove();
-		$(node).find('span.dt-column-title').each(function () {
+		$(node).find('.dt-column-order').remove();
+		$(node).find('.dt-column-title').each(function () {
 			var title = $(this).html();
 			$(this).parent().parent().append(title);
 			$(this).remove();
@@ -10282,7 +10323,7 @@
 	 *  @type string
 	 *  @default Version number
 	 */
-	DataTable.version = "2.3.5";
+	DataTable.version = "2.3.8";
 	
 	/**
 	 * Private data store, containing all of the settings objects that are
@@ -11450,7 +11491,10 @@
 		iDeferLoading: null,
 	
 		/** Event listeners */
-		on: null
+		on: null,
+	
+		/** Title wrapper element type */
+		columnTitleTag: 'span'
 	};
 	
 	_fnHungarianMap( DataTable.defaults );
@@ -12414,7 +12458,10 @@
 		orderHandler: true,
 	
 		/** Title row indicator */
-		titleRow: null
+		titleRow: null,
+	
+		/** Title wrapper element type */
+		columnTitleTag: 'span'
 	};
 	
 	/**
@@ -12558,6 +12605,7 @@
 	var __mlWarning = false;
 	var __luxon; // Can be assigned in DateTable.use()
 	var __moment; // Can be assigned in DateTable.use()
+	var __reIsoTimezone = /[T\s]\d{2}.*?(Z|[+-]\d{2}(?::?\d{2})?)$/;
 	
 	/**
 	 * 
@@ -12578,7 +12626,7 @@
 		resolveWindowLibs();
 	
 		if (__moment) {
-			dt = __moment.utc( d, format, locale, true );
+			dt = __moment( d, format, locale, true );
 	
 			if (! dt.isValid()) {
 				return null;
@@ -12688,6 +12736,16 @@
 					return d;
 				}
 	
+				// Determine if there is a timezone. If there is, we want to reuse
+				// it for the output, so the timezone doesn't change between the
+				// input and output.
+				let options = {};
+				let tzMatch = typeof d === 'string' ? d.match(__reIsoTimezone) : null;
+	
+				if (tzMatch) {
+					options.timeZone = tzMatch[1] === 'Z' ? 'UTC' : tzMatch[1];
+				}
+	
 				var dt = __mldObj(d, from, locale);
 	
 				if (dt === null) {
@@ -12701,7 +12759,7 @@
 				var formatted = to === null
 					? __mld(dt, 'toDate', 'toJSDate', '')[localeString](
 						navigator.language,
-						{ timeZone: "UTC" }
+						options
 					)
 					: __mld(dt, 'format', 'toFormat', 'toISOString', to);
 	
