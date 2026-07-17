@@ -13,12 +13,19 @@ on:
     - cron: "0 6 * * *"
   workflow_dispatch:
     inputs:
+      mode:
+        description: "sync = merge upstream; fix-ci = auto-fix fmt/clippy/typos on sync branch via Cursor"
+        type: choice
+        options:
+          - sync
+          - fix-ci
+        default: sync
       dry_run:
-        description: "Merge + cargo check only; do not push or open/update a PR"
+        description: "Do not push or open/update a PR"
         type: boolean
         default: false
       cursor_model:
-        description: "Cursor CLI model id used only when merge conflicts occur"
+        description: "Cursor CLI model id"
         type: string
         default: "composer-2.5"
 
@@ -28,7 +35,7 @@ defaults:
 
 jobs:
   sync:
-    name: Merge upstream into feature-public-api
+    name: Sync / fix CI
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     permissions:
@@ -36,24 +43,30 @@ jobs:
       pull-requests: write
     env:
       RUSTFLAGS: "-Dwarnings"
+      MODE: ${{ inputs.mode || 'sync' }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          ref: feature-public-api
+          ref: ${{ (inputs.mode || 'sync') == 'fix-ci' && 'sync/upstream-public-api' || 'feature-public-api' }}
           fetch-depth: 0
-          # Needed so the publish step can push the sync branch with GITHUB_TOKEN.
           persist-credentials: true
 
       - name: Install Cursor CLI
-        # Installed up-front so the conflict path does not depend on network mid-merge.
         run: |
           curl https://cursor.com/install -fsS | bash
           echo "${HOME}/.cursor/bin" >> "${GITHUB_PATH}"
 
+      - name: Install typos
+        run: |
+          curl -LsSf https://github.com/crate-ci/typos/releases/download/v1.47.2/typos-v1.47.2-x86_64-unknown-linux-musl.tar.gz \
+            | sudo tar -xz -C /usr/local/bin typos
+          typos --version
+
       - name: Merge upstream (no publish yet)
         id: sync
+        if: env.MODE == 'sync'
         env:
           CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
           FEATURE_BRANCH: feature-public-api
@@ -66,59 +79,94 @@ jobs:
           chmod +x .github/scripts/sync-upstream.sh
           .github/scripts/sync-upstream.sh
 
+      - name: Prepare fix-ci outputs
+        id: sync_fix
+        if: env.MODE == 'fix-ci'
+        run: |
+          echo "changed=true" >> "${GITHUB_OUTPUT}"
+          echo "conflicted=false" >> "${GITHUB_OUTPUT}"
+          echo "cursor_used=false" >> "${GITHUB_OUTPUT}"
+          echo "upstream_sha=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
+          echo "suggested_tag=" >> "${GITHUB_OUTPUT}"
+          echo "sync_branch=sync/upstream-public-api" >> "${GITHUB_OUTPUT}"
+
       - name: Install build dependencies
-        if: steps.sync.outputs.changed == 'true'
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends openssl build-essential libssl-dev pkg-config
+        if: (env.MODE == 'fix-ci') || (steps.sync.outputs.changed == 'true')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            openssl build-essential libssl-dev pkg-config \
+            libmariadb-dev-compat libpq-dev
 
       - name: Init toolchain
-        if: steps.sync.outputs.changed == 'true'
+        if: (env.MODE == 'fix-ci') || (steps.sync.outputs.changed == 'true')
         id: toolchain
         run: |
           RUST_TOOLCHAIN="$(grep -m1 -oP 'channel.*"(\K.*?)(?=")' rust-toolchain.toml)"
           echo "RUST_TOOLCHAIN=${RUST_TOOLCHAIN}" | tee -a "${GITHUB_OUTPUT}"
 
       - name: Install toolchain
-        if: steps.sync.outputs.changed == 'true'
+        if: (env.MODE == 'fix-ci') || (steps.sync.outputs.changed == 'true')
         env:
           RUST_TOOLCHAIN: ${{ steps.toolchain.outputs.RUST_TOOLCHAIN }}
         run: |
           rm -f rust-toolchain.toml
           rustup toolchain install "${RUST_TOOLCHAIN}" --profile minimal --no-self-update
+          rustup component add --toolchain "${RUST_TOOLCHAIN}" rustfmt clippy
           rustup default "${RUST_TOOLCHAIN}"
           rustc -vV
           cargo -vV
 
       - name: Rust Caching
-        if: steps.sync.outputs.changed == 'true'
+        if: (env.MODE == 'fix-ci') || (steps.sync.outputs.changed == 'true')
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           prefix-key: "v2025.09-rust-sync"
-          shared-key: "sync-sqlite-check"
+          shared-key: "sync-sqlite-clippy"
 
       - name: cargo check (sqlite)
-        if: steps.sync.outputs.changed == 'true'
+        if: env.MODE == 'sync' && steps.sync.outputs.changed == 'true'
         run: cargo check --features sqlite
+
+      - name: Auto-fix fmt/clippy/typos with Cursor
+        id: cifix
+        if: (env.MODE == 'fix-ci') || (steps.sync.outputs.changed == 'true')
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+          PROMPT_FILE: .github/prompts/fix-ci-public-api.md
+          CURSOR_MODEL: ${{ inputs.cursor_model || 'composer-2.5' }}
+          MAX_CI_FIX_ROUNDS: "5"
+        run: |
+          chmod +x .github/scripts/fix-ci-with-cursor.sh
+          .github/scripts/fix-ci-with-cursor.sh
 
       - name: Publish sync branch and PR
         id: publish
-        if: steps.sync.outputs.changed == 'true' && (github.event_name != 'workflow_dispatch' || inputs.dry_run == false)
+        if: >
+          ((env.MODE == 'fix-ci') || (steps.sync.outputs.changed == 'true'))
+          && (github.event_name != 'workflow_dispatch' || inputs.dry_run == false)
+          && steps.cifix.outputs.ci_ok == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           FEATURE_BRANCH: feature-public-api
-          SYNC_BRANCH: ${{ steps.sync.outputs.sync_branch }}
-          UPSTREAM_SHA: ${{ steps.sync.outputs.upstream_sha }}
-          SUGGESTED_TAG: ${{ steps.sync.outputs.suggested_tag }}
-          CONFLICTED: ${{ steps.sync.outputs.conflicted }}
-          CURSOR_USED: ${{ steps.sync.outputs.cursor_used }}
+          SYNC_BRANCH: sync/upstream-public-api
+          UPSTREAM_SHA: ${{ steps.sync.outputs.upstream_sha || steps.sync_fix.outputs.upstream_sha }}
+          SUGGESTED_TAG: ${{ steps.sync.outputs.suggested_tag || steps.sync_fix.outputs.suggested_tag }}
+          CONFLICTED: ${{ steps.sync.outputs.conflicted || steps.sync_fix.outputs.conflicted }}
+          CURSOR_USED: ${{ steps.sync.outputs.cursor_used || steps.sync_fix.outputs.cursor_used }}
+          CI_FIXED: ${{ steps.cifix.outputs.ci_fixed }}
           UPSTREAM_REF: main
+          MODE: ${{ env.MODE }}
         run: |
           set -euo pipefail
 
           # GITHUB_TOKEN cannot push commits that modify .github/workflows/*.
-          # Keep the fork's workflow tree from feature-public-api (includes this sync workflow).
-          git checkout "origin/${FEATURE_BRANCH}" -- .github/workflows/
+          git checkout "origin/${FEATURE_BRANCH}" -- .github/workflows/ 2>/dev/null \
+            || git checkout "origin/${SYNC_BRANCH}" -- .github/workflows/
           if ! git diff --cached --quiet -- .github/workflows/; then
-            git commit -m "chore(sync): retain fork GitHub Actions workflows"
+            git -c user.name="github-actions[bot]" \
+                -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+                commit -m "chore(sync): retain fork GitHub Actions workflows" || true
           fi
 
           git push --force origin "HEAD:${SYNC_BRANCH}"
@@ -131,49 +179,54 @@ jobs:
 
           | | |
           |---|---|
+          | Mode | \`${MODE}\` |
           | Upstream SHA | \`${UPSTREAM_SHA}\` |
           | Conflicts | ${CONFLICTED} |
-          | Cursor used | ${CURSOR_USED} |
+          | Cursor (merge) | ${CURSOR_USED} |
+          | Cursor (CI fix) | ${CI_FIXED} |
           | Suggested image tag | \`${SUGGESTED_TAG:-n/a}\` |
 
           ## Notes
 
           - Strategy is **merge** (not rebase) so this PR stays reviewable.
-          - Cursor only runs when git reports conflicts; it must not create commits/PRs itself.
-          - \`cargo check --features sqlite\` passed in this workflow before opening the PR.
+          - Cursor resolves merge conflicts and auto-fixes fmt/clippy/typos before publish.
           - Fork \`.github/workflows\` are retained on purpose: \`GITHUB_TOKEN\` cannot push workflow file updates.
-          - After merge, tag/build the Docker image separately (Phase C), e.g. \`${SUGGESTED_TAG:-<version>-public-api}\`.
 
           ## Test plan
 
-          - [ ] \`build.yml\` checks are green
-          - [ ] Spot-check Public API routes (\`/public/groups\`, \`/public/members\`, \`/public/collections\`) if conflicted files include \`src/api/core/public.rs\`
+          - [ ] \`build.yml\` / typos checks are green
+          - [ ] Spot-check Public API routes if \`src/api/core/public.rs\` changed
           EOF
           )"
-          # Strip leading spaces from heredoc indentation for readable PR body
           PR_BODY="$(sed -e 's/^          //' <<<"${PR_BODY}")"
 
           EXISTING_PR="$(gh pr list --base "${FEATURE_BRANCH}" --head "${SYNC_BRANCH}" --state open --json number --jq '.[0].number // empty')"
           if [[ -n "${EXISTING_PR}" ]]; then
             echo "Updating existing PR #${EXISTING_PR}"
-            gh pr edit "${EXISTING_PR}" --title "${PR_TITLE}" --body "${PR_BODY}"
+            gh pr edit "${EXISTING_PR}" --title "${PR_TITLE}" --body "${PR_BODY}" || true
             echo "pr_number=${EXISTING_PR}" >> "${GITHUB_OUTPUT}"
           else
             echo "Creating PR"
-            PR_URL="$(gh pr create --base "${FEATURE_BRANCH}" --head "${SYNC_BRANCH}" --title "${PR_TITLE}" --body "${PR_BODY}")"
-            echo "PR: ${PR_URL}"
-            echo "pr_url=${PR_URL}" >> "${GITHUB_OUTPUT}"
+            if PR_URL="$(gh pr create --base "${FEATURE_BRANCH}" --head "${SYNC_BRANCH}" --title "${PR_TITLE}" --body "${PR_BODY}")"; then
+              echo "PR: ${PR_URL}"
+              echo "pr_url=${PR_URL}" >> "${GITHUB_OUTPUT}"
+            else
+              echo "PR create failed (token permissions). Branch was pushed: ${SYNC_BRANCH}"
+            fi
           fi
 
       - name: Summary
         if: always()
         env:
-          CHANGED: ${{ steps.sync.outputs.changed }}
-          CONFLICTED: ${{ steps.sync.outputs.conflicted }}
-          CURSOR_USED: ${{ steps.sync.outputs.cursor_used }}
-          UPSTREAM_SHA: ${{ steps.sync.outputs.upstream_sha }}
-          SUGGESTED_TAG: ${{ steps.sync.outputs.suggested_tag }}
-          SYNC_BRANCH: ${{ steps.sync.outputs.sync_branch }}
+          MODE: ${{ env.MODE }}
+          CHANGED: ${{ steps.sync.outputs.changed || steps.sync_fix.outputs.changed }}
+          CONFLICTED: ${{ steps.sync.outputs.conflicted || steps.sync_fix.outputs.conflicted }}
+          CURSOR_USED: ${{ steps.sync.outputs.cursor_used || steps.sync_fix.outputs.cursor_used }}
+          CI_FIXED: ${{ steps.cifix.outputs.ci_fixed }}
+          CI_OK: ${{ steps.cifix.outputs.ci_ok }}
+          UPSTREAM_SHA: ${{ steps.sync.outputs.upstream_sha || steps.sync_fix.outputs.upstream_sha }}
+          SUGGESTED_TAG: ${{ steps.sync.outputs.suggested_tag || steps.sync_fix.outputs.suggested_tag }}
+          SYNC_BRANCH: sync/upstream-public-api
           PR_NUMBER: ${{ steps.publish.outputs.pr_number }}
           PR_URL: ${{ steps.publish.outputs.pr_url }}
           DRY_RUN: ${{ inputs.dry_run || false }}
@@ -183,12 +236,15 @@ jobs:
             echo ""
             echo "| Field | Value |"
             echo "|---|---|"
+            echo "| Mode | \`${MODE}\` |"
             echo "| Changed | \`${CHANGED:-n/a}\` |"
             echo "| Conflicts | \`${CONFLICTED:-n/a}\` |"
-            echo "| Cursor used | \`${CURSOR_USED:-n/a}\` |"
+            echo "| Cursor (merge) | \`${CURSOR_USED:-n/a}\` |"
+            echo "| Cursor (CI fix) | \`${CI_FIXED:-n/a}\` |"
+            echo "| CI ok | \`${CI_OK:-n/a}\` |"
             echo "| Upstream SHA | \`${UPSTREAM_SHA:-n/a}\` |"
             echo "| Suggested tag | \`${SUGGESTED_TAG:-n/a}\` |"
-            echo "| Sync branch | \`${SYNC_BRANCH:-n/a}\` |"
+            echo "| Sync branch | \`${SYNC_BRANCH}\` |"
             echo "| Dry run | \`${DRY_RUN}\` |"
             echo "| PR | ${PR_URL:-${PR_NUMBER:-n/a}} |"
           } >> "${GITHUB_STEP_SUMMARY}"
