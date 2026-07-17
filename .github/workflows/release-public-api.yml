@@ -133,7 +133,8 @@ jobs:
             --file docker/docker-bake.hcl \
             --set "*.context=." \
             --set "debian.platform=linux/amd64" \
-            --set "debian.tags=${GHCR_IMAGE}:${IMAGE_TAG},${GHCR_IMAGE}:${FLOATING_TAG}" \
+            --set "debian.tags=${GHCR_IMAGE}:${IMAGE_TAG}" \
+            --set "debian.tags=${GHCR_IMAGE}:${FLOATING_TAG}" \
             --set "debian.output=${OUTPUT}" \
             debian
 
