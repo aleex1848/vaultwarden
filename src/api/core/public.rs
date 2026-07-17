@@ -1,27 +1,27 @@
+use std::collections::{HashMap, HashSet};
+
 use chrono::Utc;
 use rocket::{
+    Request, Route,
     form::FromForm,
     request::{FromRequest, Outcome},
     serde::json::Json,
-    Request, Route,
 };
 
-use std::collections::{HashMap, HashSet};
-
 use crate::{
+    CONFIG,
     api::{core::log_event, EmptyResult, JsonResult},
     auth,
     db::{
+        DbConn,
         models::{
             Collection, CollectionGroup, CollectionId, CollectionUser, EventType, Group, GroupId, GroupUser, Invitation,
             Membership, MembershipId, MembershipStatus, MembershipType, Organization, OrganizationApiKey,
             OrganizationId, User, UserId,
         },
-        DbConn,
     },
     mail,
     util::NumberOrString,
-    CONFIG,
 };
 
 pub fn routes() -> Vec<Route> {
@@ -115,19 +115,18 @@ async fn ldap_import(data: Json<OrgImportData>, token: PublicToken, conn: DbConn
             }
         } else {
             // If user is not part of the organization
-            let user = match User::find_by_mail(&user_data.email, &conn).await {
-                Some(user) => user, // exists in vaultwarden
-                None => {
-                    // User does not exist yet
-                    let mut new_user = User::new(&user_data.email, None);
-                    new_user.save(&conn).await?;
+            let user = if let Some(user) = User::find_by_mail(&user_data.email, &conn).await {
+                user
+            } else {
+                // User does not exist yet
+                let mut new_user = User::new(&user_data.email, None);
+                new_user.save(&conn).await?;
 
-                    if !CONFIG.mail_enabled() {
-                        Invitation::new(&new_user.email).save(&conn).await?;
-                    }
-                    user_created = true;
-                    new_user
+                if !CONFIG.mail_enabled() {
+                    Invitation::new(&new_user.email).save(&conn).await?;
                 }
+                user_created = true;
+                new_user
             };
             let member_status = if CONFIG.mail_enabled() || user.password_hash.is_empty() {
                 MembershipStatus::Invited as i32
@@ -135,9 +134,10 @@ async fn ldap_import(data: Json<OrgImportData>, token: PublicToken, conn: DbConn
                 MembershipStatus::Accepted as i32 // Automatically mark user as accepted if no email invites
             };
 
-            let (org_name, org_email) = match Organization::find_by_uuid(&org_id, &conn).await {
-                Some(org) => (org.name, org.billing_email),
-                None => err!("Error looking up organization"),
+            let (org_name, org_email) = if let Some(org) = Organization::find_by_uuid(&org_id, &conn).await {
+                (org.name, org.billing_email)
+            } else {
+                err!("Error looking up organization")
             };
 
             let mut new_member = Membership::new(user.uuid.clone(), org_id.clone(), Some(org_email.clone()));
@@ -148,40 +148,36 @@ async fn ldap_import(data: Json<OrgImportData>, token: PublicToken, conn: DbConn
 
             new_member.save(&conn).await?;
 
-            if CONFIG.mail_enabled() {
-                if let Err(e) =
+            if CONFIG.mail_enabled()
+                && let Err(e) =
                     mail::send_invite(&user, org_id.clone(), new_member.uuid.clone(), &org_name, Some(org_email)).await
-                {
-                    // Upon error delete the user, invite and org member records when needed
-                    if user_created {
-                        user.delete(&conn).await?;
-                    } else {
-                        new_member.delete(&conn).await?;
-                    }
-
-                    err!(format!("Error sending invite: {e:?} "));
+            {
+                // Upon error delete the user, invite and org member records when needed
+                if user_created {
+                    user.delete(&conn).await?;
+                } else {
+                    new_member.delete(&conn).await?;
                 }
+
+                err!(format!("Error sending invite: {e:?} "));
             }
         }
     }
 
     if CONFIG.org_groups_enabled() {
         for group_data in &data.groups {
-            let group_uuid = match Group::find_by_external_id_and_org(&group_data.external_id, &org_id, &conn).await {
-                Some(group) => group.uuid,
-                None => {
-                    let mut group = Group::new(
-                        org_id.clone(),
-                        group_data.name.clone(),
-                        false,
-                        Some(group_data.external_id.clone()),
-                    );
-                    group.save(&conn).await?;
-                    group.uuid
-                }
+            let group_uuid = if let Some(group) =
+                Group::find_by_external_id_and_org(&group_data.external_id, &org_id, &conn).await
+            {
+                group.uuid
+            } else {
+                let mut group =
+                    Group::new(org_id.clone(), group_data.name.clone(), false, Some(group_data.external_id.clone()));
+                group.save(&conn).await?;
+                group.uuid
             };
 
-            GroupUser::delete_all_by_group(&group_uuid, &conn).await?;
+            GroupUser::delete_all_by_group(&group_uuid, &org_id, &conn).await?;
 
             for ext_id in &group_data.member_external_ids {
                 if let Some(member) = Membership::find_by_external_id_and_org(ext_id, &org_id, &conn).await {
@@ -199,18 +195,17 @@ async fn ldap_import(data: Json<OrgImportData>, token: PublicToken, conn: DbConn
         // Generate a HashSet to quickly verify if a member is listed or not.
         let sync_members: HashSet<String> = data.members.into_iter().map(|m| m.external_id).collect();
         for member in Membership::find_by_org(&org_id, &conn).await {
-            if let Some(ref user_external_id) = member.external_id {
-                if !sync_members.contains(user_external_id) {
-                    if member.atype == MembershipType::Owner && member.status == MembershipStatus::Confirmed as i32 {
-                        // Removing owner, check that there is at least one other confirmed owner
-                        if Membership::count_confirmed_by_org_and_type(&org_id, MembershipType::Owner, &conn).await <= 1
-                        {
-                            warn!("Can't delete the last owner");
-                            continue;
-                        }
+            if let Some(ref user_external_id) = member.external_id
+                && !sync_members.contains(user_external_id)
+            {
+                if member.atype == MembershipType::Owner && member.status == MembershipStatus::Confirmed as i32 {
+                    // Removing owner, check that there is at least one other confirmed owner
+                    if Membership::count_confirmed_by_org_and_type(&org_id, MembershipType::Owner, &conn).await <= 1 {
+                        warn!("Can't delete the last owner");
+                        continue;
                     }
-                    member.delete(&conn).await?;
                 }
+                member.delete(&conn).await?;
             }
         }
     }
@@ -304,12 +299,14 @@ impl<'r> FromRequest<'r> for PublicToken {
     async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
         let headers = request.headers();
         // Get access_token
-        let access_token: &str = match headers.get_one("Authorization") {
-            Some(a) => match a.rsplit("Bearer ").next() {
-                Some(split) => split,
-                None => err_handler!("No access token provided"),
-            },
-            None => err_handler!("No access token provided"),
+        let access_token: &str = if let Some(a) = headers.get_one("Authorization") {
+            if let Some(split) = a.rsplit("Bearer ").next() {
+                split
+            } else {
+                err_handler!("No access token provided")
+            }
+        } else {
+            err_handler!("No access token provided")
         };
         // Check JWT token is valid and get device and user from it
         let Ok(claims) = auth::decode_api_org(access_token) else {
@@ -331,14 +328,13 @@ impl<'r> FromRequest<'r> for PublicToken {
 
         // Check if claims.sub is org_api_key.uuid
         // Check if claims.client_sub is org_api_key.org_uuid
-        let conn = match DbConn::from_request(request).await {
-            Outcome::Success(conn) => conn,
-            _ => err_handler!("Error getting DB"),
+        let Outcome::Success(conn) = DbConn::from_request(request).await else {
+            err_handler!("Error getting DB")
         };
         let Some(org_id) = claims.client_id.strip_prefix("organization.") else {
             err_handler!("Malformed client_id")
         };
-        let org_id: OrganizationId = org_id.to_string().into();
+        let org_id: OrganizationId = org_id.to_owned().into();
         let Some(org_api_key) = OrganizationApiKey::find_by_org_uuid(&org_id, &conn).await else {
             err_handler!("Invalid client_id")
         };
@@ -384,7 +380,7 @@ async fn public_add_update_group(
     mut group: Group,
     collections: Vec<PublicCollectionData>,
     members: Vec<MembershipId>,
-    _org_id: OrganizationId,
+    org_id: OrganizationId,
     conn: &DbConn,
 ) -> JsonResult {
     group.save(conn).await?;
@@ -397,7 +393,7 @@ async fn public_add_update_group(
             col_selection.hide_passwords,
             col_selection.manage,
         );
-        collection_group.save(conn).await?;
+        collection_group.save(&org_id, conn).await?;
     }
 
     for assigned_member in members {
@@ -501,8 +497,8 @@ async fn public_put_group(
     group.name.clone_from(&group_request.name);
     group.access_all = group_request.access_all;
 
-    CollectionGroup::delete_all_by_group(&group_id, &conn).await?;
-    GroupUser::delete_all_by_group(&group_id, &conn).await?;
+    CollectionGroup::delete_all_by_group(&group_id, &org_id, &conn).await?;
+    GroupUser::delete_all_by_group(&group_id, &org_id, &conn).await?;
 
     // Note: Event logging without user context
     log_event(
@@ -542,7 +538,7 @@ async fn public_delete_group(group_id: GroupId, token: PublicToken, conn: DbConn
     )
     .await;
 
-    group.delete(&conn).await
+    group.delete(&org_id, &conn).await
 }
 
 #[get("/public/groups/<group_id>/users")]
@@ -556,7 +552,7 @@ async fn public_get_group_members(group_id: GroupId, token: PublicToken, conn: D
         err!("Group could not be found!", "Group uuid is invalid or does not belong to the organization")
     };
 
-    let group_members: Vec<MembershipId> = GroupUser::find_by_group(&group_id, &conn)
+    let group_members: Vec<MembershipId> = GroupUser::find_by_group(&group_id, &org_id, &conn)
         .await
         .iter()
         .map(|entry| entry.users_organizations_uuid.clone())
@@ -581,7 +577,7 @@ async fn public_put_group_members(
         err!("Group could not be found!", "Group uuid is invalid or does not belong to the organization")
     };
 
-    GroupUser::delete_all_by_group(&group_id, &conn).await?;
+    GroupUser::delete_all_by_group(&group_id, &org_id, &conn).await?;
 
     let assigned_members = data.into_inner();
     for assigned_member in assigned_members {
@@ -908,7 +904,7 @@ async fn public_post_collection(data: Json<PublicCollectionRequest>, token: Publ
     // Add groups
     for group in data.groups {
         CollectionGroup::new(collection.uuid.clone(), group.id, group.read_only, group.hide_passwords, group.manage)
-            .save(&conn)
+            .save(&org_id, &conn)
             .await?;
     }
 
@@ -965,10 +961,10 @@ async fn public_put_collection(
     .await;
 
     // Update groups
-    CollectionGroup::delete_all_by_collection(&collection_id, &conn).await?;
+    CollectionGroup::delete_all_by_collection(&collection_id, &org_id, &conn).await?;
     for group in data.groups {
         CollectionGroup::new(collection_id.clone(), group.id, group.read_only, group.hide_passwords, group.manage)
-            .save(&conn)
+            .save(&org_id, &conn)
             .await?;
     }
 

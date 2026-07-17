@@ -1,21 +1,24 @@
 use std::path::{Path, PathBuf};
 
 use rocket::{
+    Catcher, Route,
     fs::NamedFile,
     http::ContentType,
-    response::{content::RawCss as Css, content::RawHtml as Html, Redirect},
+    response::{Redirect, content::RawCss as Css, content::RawHtml as Html},
     serde::json::Json,
-    Catcher, Route,
 };
 use serde_json::Value;
 
 use crate::{
-    api::{core::now, ApiResult, EmptyResult},
+    CONFIG,
+    api::{ApiResult, EmptyResult, core::now},
     auth::decode_file_download,
-    db::models::{AttachmentId, CipherId},
+    db::{
+        DbConn,
+        models::{AttachmentId, CipherId},
+    },
     error::Error,
     util::Cached,
-    CONFIG,
 };
 
 pub fn routes() -> Vec<Route> {
@@ -23,12 +26,20 @@ pub fn routes() -> Vec<Route> {
     // crate::utils::LOGGED_ROUTES to make sure they appear in the log
     let mut routes = routes![attachments, alive, alive_head, static_files];
     if CONFIG.web_vault_enabled() {
-        routes.append(&mut routes![web_index, web_index_direct, web_index_head, app_id, web_files, vaultwarden_css]);
+        routes.append(&mut routes![
+            web_index,
+            web_index_direct,
+            web_index_head,
+            app_id,
+            apple_app_site_association,
+            web_files,
+            vaultwarden_css
+        ]);
     }
 
     #[cfg(debug_assertions)]
     if CONFIG.reload_templates() {
-        routes.append(&mut routes![_static_files_dev]);
+        routes.append(&mut routes![static_files_dev]);
     }
 
     routes
@@ -60,11 +71,13 @@ fn vaultwarden_css() -> Cached<Css<String>> {
         "mail_2fa_enabled": CONFIG._enable_email_2fa(),
         "mail_enabled": CONFIG.mail_enabled(),
         "sends_allowed": CONFIG.sends_allowed(),
+        "remember_2fa_disabled": CONFIG.disable_2fa_remember(),
+        "password_hints_allowed": CONFIG.password_hints_allowed(),
         "signup_disabled": CONFIG.is_signup_disabled(),
         "sso_enabled": CONFIG.sso_enabled(),
         "sso_only": CONFIG.sso_enabled() && CONFIG.sso_only(),
-        "yubico_enabled": CONFIG._enable_yubico() && CONFIG.yubico_client_id().is_some() && CONFIG.yubico_secret_key().is_some(),
         "webauthn_2fa_supported": CONFIG.is_webauthn_2fa_supported(),
+        "yubico_enabled": CONFIG._enable_yubico() && CONFIG.yubico_client_id().is_some() && CONFIG.yubico_secret_key().is_some(),
     });
 
     let scss = match CONFIG.render_template("scss/vaultwarden.scss", &css_options) {
@@ -158,6 +171,24 @@ fn app_id() -> Cached<(ContentType, Json<Value>)> {
     )
 }
 
+#[get("/.well-known/apple-app-site-association")]
+fn apple_app_site_association() -> Cached<(ContentType, Json<Value>)> {
+    Cached::long(
+        (
+            ContentType::JSON,
+            Json(json!({
+                "webcredentials": {
+                    "apps": [
+                        "LTZ2PFU5D6.com.8bit.bitwarden",
+                        "LTZ2PFU5D6.com.8bit.bitwarden.beta"
+                    ]
+                }
+            })),
+        ),
+        true,
+    )
+}
+
 #[get("/<p..>", rank = 10)] // Only match this if the other routes don't match
 async fn web_files(p: PathBuf) -> Cached<Option<NamedFile>> {
     Cached::long(NamedFile::open(Path::new(&CONFIG.web_vault_folder()).join(p)).await.ok(), true)
@@ -176,7 +207,6 @@ async fn attachments(cipher_id: CipherId, file_id: AttachmentId, token: String) 
 }
 
 // We use DbConn here to let the alive healthcheck also verify the database connection.
-use crate::db::DbConn;
 #[get("/alive")]
 fn alive(_conn: DbConn) -> Json<String> {
     now()
@@ -195,7 +225,7 @@ fn alive_head(_conn: DbConn) -> EmptyResult {
 // NOTE: Do not forget to add any new files added to the `static_files` function below!
 #[cfg(debug_assertions)]
 #[get("/vw_static/<filename>", rank = 1)]
-pub async fn _static_files_dev(filename: PathBuf) -> Option<NamedFile> {
+pub async fn static_files_dev(filename: PathBuf) -> Option<NamedFile> {
     warn!("LOADING STATIC FILES FROM DISK");
     let file = filename.to_str().unwrap_or_default();
     let ext = filename.extension().unwrap_or_default();
@@ -208,7 +238,7 @@ pub async fn _static_files_dev(filename: PathBuf) -> Option<NamedFile> {
 
     if let Ok(path) = path {
         return NamedFile::open(path).await.ok();
-    };
+    }
     None
 }
 
@@ -238,8 +268,8 @@ pub fn static_files(filename: &str) -> Result<(ContentType, &'static [u8]), Erro
         "jdenticon-3.3.0.js" => Ok((ContentType::JavaScript, include_bytes!("../static/scripts/jdenticon-3.3.0.js"))),
         "datatables.js" => Ok((ContentType::JavaScript, include_bytes!("../static/scripts/datatables.js"))),
         "datatables.css" => Ok((ContentType::CSS, include_bytes!("../static/scripts/datatables.css"))),
-        "jquery-3.7.1.slim.js" => {
-            Ok((ContentType::JavaScript, include_bytes!("../static/scripts/jquery-3.7.1.slim.js")))
+        "jquery-4.0.0.slim.js" => {
+            Ok((ContentType::JavaScript, include_bytes!("../static/scripts/jquery-4.0.0.slim.js")))
         }
         _ => err!(format!("Static file not found: {filename}")),
     }
