@@ -1,20 +1,20 @@
 use chrono::{DateTime, TimeDelta, Utc};
-use rocket::serde::json::Json;
-use rocket::Route;
+use rocket::{Route, serde::json::Json};
 
 use crate::{
+    CONFIG,
     api::{
-        core::{log_user_event, two_factor::_generate_recover_code},
         EmptyResult, JsonResult, PasswordOrOtpData,
+        core::{log_user_event, two_factor::generate_recover_code},
     },
-    auth::Headers,
+    auth::{ClientHeaders, Headers},
     crypto,
     db::{
-        models::{DeviceId, EventType, TwoFactor, TwoFactorType, User, UserId},
         DbConn,
+        models::{AuthRequest, AuthRequestId, DeviceId, EventType, TwoFactor, TwoFactorType, User, UserId},
     },
     error::{Error, MapResult},
-    mail, CONFIG,
+    mail,
 };
 
 pub fn routes() -> Vec<Route> {
@@ -25,46 +25,77 @@ pub fn routes() -> Vec<Route> {
 #[serde(rename_all = "camelCase")]
 struct SendEmailLoginData {
     #[serde(alias = "DeviceIdentifier")]
-    device_identifier: DeviceId,
+    device_identifier: Option<DeviceId>,
     #[serde(alias = "Email")]
     email: Option<String>,
     #[serde(alias = "MasterPasswordHash")]
     master_password_hash: Option<String>,
+    auth_request_id: Option<AuthRequestId>,
+    auth_request_access_code: Option<String>,
 }
 
 /// User is trying to login and wants to use email 2FA.
 /// Does not require Bearer token
 #[post("/two-factor/send-email-login", data = "<data>")] // JsonResult
-async fn send_email_login(data: Json<SendEmailLoginData>, conn: DbConn) -> EmptyResult {
+async fn send_email_login(data: Json<SendEmailLoginData>, client_headers: ClientHeaders, conn: DbConn) -> EmptyResult {
     let data: SendEmailLoginData = data.into_inner();
 
     if !CONFIG._enable_email_2fa() {
         err!("Email 2FA is disabled")
     }
 
+    // Ratelimit the login
+    crate::ratelimit::check_limit_login(&client_headers.ip.ip)?;
+
     // Get the user
     let email = match &data.email {
         Some(email) if !email.is_empty() => Some(email),
         _ => None,
     };
-    let user = if let Some(email) = email {
-        let Some(master_password_hash) = &data.master_password_hash else {
-            err!("No password hash has been submitted.")
-        };
+    let master_password_hash = match &data.master_password_hash {
+        Some(password_hash) if !password_hash.is_empty() => Some(password_hash),
+        _ => None,
+    };
+    let auth_request_id = match &data.auth_request_id {
+        Some(auth_request_id) if !auth_request_id.is_empty() => Some(auth_request_id),
+        _ => None,
+    };
 
+    let user = if let Some(email) = email {
         let Some(user) = User::find_by_mail(email, &conn).await else {
             err!("Username or password is incorrect. Try again.")
         };
 
-        // Check password
-        if !user.check_valid_password(master_password_hash) {
-            err!("Username or password is incorrect. Try again.")
+        if let Some(master_password_hash) = master_password_hash {
+            // Check password
+            if !user.check_valid_password(master_password_hash) {
+                err!("Username or password is incorrect. Try again.")
+            }
+        } else if let Some(auth_request_id) = auth_request_id {
+            let Some(auth_request) = AuthRequest::find_by_uuid(auth_request_id, &conn).await else {
+                err!("AuthRequest doesn't exist", "User not found")
+            };
+            let Some(code) = &data.auth_request_access_code else {
+                err!("no auth request access code")
+            };
+
+            if auth_request.device_type != client_headers.device_type
+                || auth_request.request_ip != client_headers.ip.ip.to_string()
+                || !auth_request.check_access_code(code)
+            {
+                err!("AuthRequest doesn't exist", "Invalid device, IP or code")
+            }
+        } else {
+            err!("No password hash has been submitted.")
         }
 
         user
     } else {
+        let Some(device_identifier) = &data.device_identifier else {
+            err!("No device identifier has been submitted.")
+        };
         // SSO login only sends device id, so we get the user by the most recently used device
-        let Some(user) = User::find_by_device_for_email2fa(&data.device_identifier, &conn).await else {
+        let Some(user) = User::find_by_device_for_email2fa(device_identifier, &conn).await else {
             err!("Username or password is incorrect. Try again.")
         };
 
@@ -201,7 +232,7 @@ async fn email(data: Json<EmailData>, headers: Headers, conn: DbConn) -> JsonRes
     twofactor.data = email_data.to_json();
     twofactor.save(&conn).await?;
 
-    _generate_recover_code(&mut user, &conn).await;
+    generate_recover_code(&mut user, &conn).await;
 
     log_user_event(EventType::UserUpdated2fa as i32, &user.uuid, headers.device.atype, &headers.ip.ip, &conn).await;
 
@@ -253,9 +284,9 @@ pub async fn validate_email_code_str(
     twofactor.data = email_data.to_json();
     twofactor.save(conn).await?;
 
-    let date = DateTime::from_timestamp(email_data.token_sent, 0).expect("Email token timestamp invalid.").naive_utc();
-    let max_time = CONFIG.email_expiration_time() as i64;
-    if date + TimeDelta::try_seconds(max_time).unwrap() < Utc::now().naive_utc() {
+    let dt = DateTime::from_timestamp(email_data.token_sent, 0).expect("Email token timestamp invalid.").naive_utc();
+    let max_time = CONFIG.email_expiration_time().cast_signed();
+    if dt + TimeDelta::try_seconds(max_time).unwrap() < Utc::now().naive_utc() {
         err!(
             "Token has expired",
             ErrorEvent {
@@ -311,9 +342,10 @@ impl EmailTokenData {
 
     pub fn from_json(string: &str) -> Result<EmailTokenData, Error> {
         let res: Result<EmailTokenData, serde_json::Error> = serde_json::from_str(string);
-        match res {
-            Ok(x) => Ok(x),
-            Err(_) => err!("Could not decode EmailTokenData from string"),
+        if let Ok(x) = res {
+            Ok(x)
+        } else {
+            err!("Could not decode EmailTokenData from string")
         }
     }
 }
@@ -331,18 +363,17 @@ pub async fn activate_email_2fa(user: &User, conn: &DbConn) -> EmptyResult {
 pub fn obscure_email(email: &str) -> String {
     let split: Vec<&str> = email.rsplitn(2, '@').collect();
 
-    let mut name = split[1].to_string();
+    let mut name = split[1].to_owned();
     let domain = &split[0];
 
     let name_size = name.chars().count();
 
-    let new_name = match name_size {
-        1..=3 => "*".repeat(name_size),
-        _ => {
-            let stars = "*".repeat(name_size - 2);
-            name.truncate(2);
-            format!("{name}{stars}")
-        }
+    let new_name = if let 1..=3 = name_size {
+        "*".repeat(name_size)
+    } else {
+        let stars = "*".repeat(name_size - 2);
+        name.truncate(2);
+        format!("{name}{stars}")
     };
 
     format!("{new_name}@{domain}")
