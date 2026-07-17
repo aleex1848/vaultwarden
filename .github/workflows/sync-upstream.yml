@@ -111,6 +111,14 @@ jobs:
           UPSTREAM_REF: main
         run: |
           set -euo pipefail
+
+          # GITHUB_TOKEN cannot push commits that modify .github/workflows/*.
+          # Keep the fork's workflow tree from feature-public-api (includes this sync workflow).
+          git checkout "origin/${FEATURE_BRANCH}" -- .github/workflows/
+          if ! git diff --cached --quiet -- .github/workflows/; then
+            git commit -m "chore(sync): retain fork GitHub Actions workflows"
+          fi
+
           git push --force origin "HEAD:${SYNC_BRANCH}"
 
           PR_TITLE="chore(sync): merge upstream/${UPSTREAM_REF} into ${FEATURE_BRANCH}"
@@ -131,6 +139,7 @@ jobs:
           - Strategy is **merge** (not rebase) so this PR stays reviewable.
           - Cursor only runs when git reports conflicts; it must not create commits/PRs itself.
           - \`cargo check --features sqlite\` passed in this workflow before opening the PR.
+          - Fork \`.github/workflows\` are retained on purpose: \`GITHUB_TOKEN\` cannot push workflow file updates.
           - After merge, tag/build the Docker image separately (Phase C), e.g. \`${SUGGESTED_TAG:-<version>-public-api}\`.
 
           ## Test plan
