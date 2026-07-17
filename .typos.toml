@@ -4,6 +4,7 @@ extend-exclude = [
     "playwright/",
     "*.js", # Ignore all JavaScript files
     "!admin*.js", # Except our own JavaScript files
+    "TEST_PUBLIC_API.md", # German documentation
 ]
 ignore-hidden = false
 
