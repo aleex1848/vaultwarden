@@ -106,7 +106,8 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          # Prefer PAT: existing package may reject GITHUB_TOKEN pushes (403).
+          password: ${{ secrets.SYNC_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Bake and push debian/amd64 image
         env:
