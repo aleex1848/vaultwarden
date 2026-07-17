@@ -176,6 +176,12 @@ jobs:
 
           git push --force origin "HEAD:${SYNC_BRANCH}"
 
+          # Give GitHub a moment to register the force-pushed head ref.
+          sleep 3
+
+          REPO="${GITHUB_REPOSITORY}"
+          HEAD_REF="${GITHUB_REPOSITORY_OWNER}:${SYNC_BRANCH}"
+
           PR_TITLE="chore(sync): merge upstream/${UPSTREAM_REF} into ${FEATURE_BRANCH}"
           PR_BODY="$(cat <<EOF
           ## Summary
@@ -206,12 +212,12 @@ jobs:
           )"
           PR_BODY="$(sed -e 's/^          //' <<<"${PR_BODY}")"
 
-          PR_NUM="$(gh pr list --base "${FEATURE_BRANCH}" --head "${SYNC_BRANCH}" --state open --json number --jq '.[0].number // empty')"
+          PR_NUM="$(gh pr list --repo "${REPO}" --base "${FEATURE_BRANCH}" --head "${SYNC_BRANCH}" --state open --json number --jq '.[0].number // empty')"
           if [[ -z "${PR_NUM}" ]]; then
-            CLOSED_PR="$(gh pr list --base "${FEATURE_BRANCH}" --head "${SYNC_BRANCH}" --state closed --json number --jq '.[0].number // empty')"
+            CLOSED_PR="$(gh pr list --repo "${REPO}" --base "${FEATURE_BRANCH}" --head "${SYNC_BRANCH}" --state closed --json number --jq '.[0].number // empty')"
             if [[ -n "${CLOSED_PR}" ]]; then
               echo "Reopening closed PR #${CLOSED_PR}"
-              if gh pr reopen "${CLOSED_PR}"; then
+              if gh pr reopen --repo "${REPO}" "${CLOSED_PR}"; then
                 PR_NUM="${CLOSED_PR}"
               fi
             fi
@@ -219,25 +225,25 @@ jobs:
 
           if [[ -n "${PR_NUM}" ]]; then
             echo "Updating existing PR #${PR_NUM}"
-            gh pr edit "${PR_NUM}" --title "${PR_TITLE}" --body "${PR_BODY}" || true
+            gh pr edit --repo "${REPO}" "${PR_NUM}" --title "${PR_TITLE}" --body "${PR_BODY}" || true
             echo "pr_number=${PR_NUM}" >> "${GITHUB_OUTPUT}"
           else
-            echo "Creating PR"
-            if PR_URL="$(gh pr create --base "${FEATURE_BRANCH}" --head "${SYNC_BRANCH}" --title "${PR_TITLE}" --body "${PR_BODY}")"; then
+            echo "Creating PR (head=${HEAD_REF})"
+            if PR_URL="$(gh pr create --repo "${REPO}" --base "${FEATURE_BRANCH}" --head "${HEAD_REF}" --title "${PR_TITLE}" --body "${PR_BODY}" 2>&1)"; then
               echo "PR: ${PR_URL}"
               echo "pr_url=${PR_URL}" >> "${GITHUB_OUTPUT}"
-              PR_NUM="$(gh pr list --base "${FEATURE_BRANCH}" --head "${SYNC_BRANCH}" --state open --json number --jq '.[0].number // empty')"
+              PR_NUM="$(gh pr list --repo "${REPO}" --base "${FEATURE_BRANCH}" --head "${SYNC_BRANCH}" --state open --json number --jq '.[0].number // empty')"
               echo "pr_number=${PR_NUM}" >> "${GITHUB_OUTPUT}"
             else
-              echo "PR create failed. Set repo secret SYNC_GITHUB_TOKEN (classic PAT with 'repo') for PR create/auto-merge."
-              echo "Branch was pushed: ${SYNC_BRANCH}"
+              echo "PR create failed: ${PR_URL}"
+              echo "Ensure SYNC_GITHUB_TOKEN is a classic PAT with 'repo' scope."
               PR_NUM=""
             fi
           fi
 
           if [[ -n "${PR_NUM}" ]]; then
             echo "Enabling auto-merge for PR #${PR_NUM}"
-            if gh pr merge "${PR_NUM}" --auto --merge; then
+            if gh pr merge --repo "${REPO}" "${PR_NUM}" --auto --merge; then
               echo "auto_merge=true" >> "${GITHUB_OUTPUT}"
             else
               echo "Auto-merge could not be enabled (check Allow auto-merge + ruleset + SYNC_GITHUB_TOKEN)."
