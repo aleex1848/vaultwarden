@@ -60,9 +60,12 @@ jobs:
 
       - name: Install typos
         run: |
+          TMP_DIR="${RUNNER_TEMP}/typos-install"
+          mkdir -p "${TMP_DIR}"
           curl -LsSf https://github.com/crate-ci/typos/releases/download/v1.47.2/typos-v1.47.2-x86_64-unknown-linux-musl.tar.gz \
-            | tar -xz -C /tmp
-          sudo install -m 0755 /tmp/typos /usr/local/bin/typos
+            -o "${TMP_DIR}/typos.tgz"
+          tar -xzf "${TMP_DIR}/typos.tgz" -C "${TMP_DIR}"
+          sudo install -m 0755 "${TMP_DIR}/typos" /usr/local/bin/typos
           typos --version
 
       - name: Merge upstream (no publish yet)
