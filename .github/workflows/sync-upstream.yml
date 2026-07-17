@@ -1,0 +1,183 @@
+name: Sync Upstream
+permissions: {}
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+on:
+  schedule:
+    # Daily 06:00 UTC
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Merge + cargo check only; do not push or open/update a PR"
+        type: boolean
+        default: false
+      cursor_model:
+        description: "Cursor CLI model id used only when merge conflicts occur"
+        type: string
+        default: "composer-2.5"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  sync:
+    name: Merge upstream into feature-public-api
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      RUSTFLAGS: "-Dwarnings"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: feature-public-api
+          fetch-depth: 0
+          # Needed so the publish step can push the sync branch with GITHUB_TOKEN.
+          persist-credentials: true
+
+      - name: Install Cursor CLI
+        # Installed up-front so the conflict path does not depend on network mid-merge.
+        run: |
+          curl https://cursor.com/install -fsS | bash
+          echo "${HOME}/.cursor/bin" >> "${GITHUB_PATH}"
+
+      - name: Merge upstream (no publish yet)
+        id: sync
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+          FEATURE_BRANCH: feature-public-api
+          SYNC_BRANCH: sync/upstream-public-api
+          UPSTREAM_URL: https://github.com/dani-garcia/vaultwarden.git
+          UPSTREAM_REF: main
+          PROMPT_FILE: .github/prompts/sync-public-api.md
+          CURSOR_MODEL: ${{ inputs.cursor_model || 'composer-2.5' }}
+        run: |
+          chmod +x .github/scripts/sync-upstream.sh
+          .github/scripts/sync-upstream.sh
+
+      - name: Install build dependencies
+        if: steps.sync.outputs.changed == 'true'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends openssl build-essential libssl-dev pkg-config
+
+      - name: Init toolchain
+        if: steps.sync.outputs.changed == 'true'
+        id: toolchain
+        run: |
+          RUST_TOOLCHAIN="$(grep -m1 -oP 'channel.*"(\K.*?)(?=")' rust-toolchain.toml)"
+          echo "RUST_TOOLCHAIN=${RUST_TOOLCHAIN}" | tee -a "${GITHUB_OUTPUT}"
+
+      - name: Install toolchain
+        if: steps.sync.outputs.changed == 'true'
+        env:
+          RUST_TOOLCHAIN: ${{ steps.toolchain.outputs.RUST_TOOLCHAIN }}
+        run: |
+          rm -f rust-toolchain.toml
+          rustup toolchain install "${RUST_TOOLCHAIN}" --profile minimal --no-self-update
+          rustup default "${RUST_TOOLCHAIN}"
+          rustc -vV
+          cargo -vV
+
+      - name: Rust Caching
+        if: steps.sync.outputs.changed == 'true'
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          prefix-key: "v2025.09-rust-sync"
+          shared-key: "sync-sqlite-check"
+
+      - name: cargo check (sqlite)
+        if: steps.sync.outputs.changed == 'true'
+        run: cargo check --features sqlite
+
+      - name: Publish sync branch and PR
+        id: publish
+        if: steps.sync.outputs.changed == 'true' && (github.event_name != 'workflow_dispatch' || inputs.dry_run == false)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FEATURE_BRANCH: feature-public-api
+          SYNC_BRANCH: ${{ steps.sync.outputs.sync_branch }}
+          UPSTREAM_SHA: ${{ steps.sync.outputs.upstream_sha }}
+          SUGGESTED_TAG: ${{ steps.sync.outputs.suggested_tag }}
+          CONFLICTED: ${{ steps.sync.outputs.conflicted }}
+          CURSOR_USED: ${{ steps.sync.outputs.cursor_used }}
+          UPSTREAM_REF: main
+        run: |
+          set -euo pipefail
+          git push --force origin "HEAD:${SYNC_BRANCH}"
+
+          PR_TITLE="chore(sync): merge upstream/${UPSTREAM_REF} into ${FEATURE_BRANCH}"
+          PR_BODY="$(cat <<EOF
+          ## Summary
+
+          Automated sync of \`dani-garcia/vaultwarden\` (\`upstream/${UPSTREAM_REF}\`) into \`${FEATURE_BRANCH}\`.
+
+          | | |
+          |---|---|
+          | Upstream SHA | \`${UPSTREAM_SHA}\` |
+          | Conflicts | ${CONFLICTED} |
+          | Cursor used | ${CURSOR_USED} |
+          | Suggested image tag | \`${SUGGESTED_TAG:-n/a}\` |
+
+          ## Notes
+
+          - Strategy is **merge** (not rebase) so this PR stays reviewable.
+          - Cursor only runs when git reports conflicts; it must not create commits/PRs itself.
+          - \`cargo check --features sqlite\` passed in this workflow before opening the PR.
+          - After merge, tag/build the Docker image separately (Phase C), e.g. \`${SUGGESTED_TAG:-<version>-public-api}\`.
+
+          ## Test plan
+
+          - [ ] \`build.yml\` checks are green
+          - [ ] Spot-check Public API routes (\`/public/groups\`, \`/public/members\`, \`/public/collections\`) if conflicted files include \`src/api/core/public.rs\`
+          EOF
+          )"
+          # Strip leading spaces from heredoc indentation for readable PR body
+          PR_BODY="$(sed -e 's/^          //' <<<"${PR_BODY}")"
+
+          EXISTING_PR="$(gh pr list --base "${FEATURE_BRANCH}" --head "${SYNC_BRANCH}" --state open --json number --jq '.[0].number // empty')"
+          if [[ -n "${EXISTING_PR}" ]]; then
+            echo "Updating existing PR #${EXISTING_PR}"
+            gh pr edit "${EXISTING_PR}" --title "${PR_TITLE}" --body "${PR_BODY}"
+            echo "pr_number=${EXISTING_PR}" >> "${GITHUB_OUTPUT}"
+          else
+            echo "Creating PR"
+            PR_URL="$(gh pr create --base "${FEATURE_BRANCH}" --head "${SYNC_BRANCH}" --title "${PR_TITLE}" --body "${PR_BODY}")"
+            echo "PR: ${PR_URL}"
+            echo "pr_url=${PR_URL}" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Summary
+        if: always()
+        env:
+          CHANGED: ${{ steps.sync.outputs.changed }}
+          CONFLICTED: ${{ steps.sync.outputs.conflicted }}
+          CURSOR_USED: ${{ steps.sync.outputs.cursor_used }}
+          UPSTREAM_SHA: ${{ steps.sync.outputs.upstream_sha }}
+          SUGGESTED_TAG: ${{ steps.sync.outputs.suggested_tag }}
+          SYNC_BRANCH: ${{ steps.sync.outputs.sync_branch }}
+          PR_NUMBER: ${{ steps.publish.outputs.pr_number }}
+          PR_URL: ${{ steps.publish.outputs.pr_url }}
+          DRY_RUN: ${{ inputs.dry_run || false }}
+        run: |
+          {
+            echo "## Sync Upstream"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Changed | \`${CHANGED:-n/a}\` |"
+            echo "| Conflicts | \`${CONFLICTED:-n/a}\` |"
+            echo "| Cursor used | \`${CURSOR_USED:-n/a}\` |"
+            echo "| Upstream SHA | \`${UPSTREAM_SHA:-n/a}\` |"
+            echo "| Suggested tag | \`${SUGGESTED_TAG:-n/a}\` |"
+            echo "| Sync branch | \`${SYNC_BRANCH:-n/a}\` |"
+            echo "| Dry run | \`${DRY_RUN}\` |"
+            echo "| PR | ${PR_URL:-${PR_NUMBER:-n/a}} |"
+          } >> "${GITHUB_STEP_SUMMARY}"
