@@ -1,0 +1,165 @@
+name: Release Public API
+permissions: {}
+
+concurrency:
+  group: release-public-api-${{ github.ref }}
+  cancel-in-progress: false
+
+on:
+  push:
+    branches:
+      - feature-public-api
+    paths:
+      - "src/**"
+      - "migrations/**"
+      - "macros/**"
+      - "Cargo.*"
+      - "build.rs"
+      - "rust-toolchain.toml"
+      - "docker/**"
+      - ".github/workflows/release-public-api.yml"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Optional upstream version override (e.g. 1.36.0). Empty = latest upstream release."
+        type: string
+        required: false
+        default: ""
+      dry_run:
+        description: "Build locally in CI but do not push image or git tag"
+        type: boolean
+        default: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  release:
+    name: Tag and publish GHCR image
+    if: github.repository == 'aleex1848/vaultwarden'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    permissions:
+      contents: write
+      packages: write
+      attestations: write
+      id-token: write
+    env:
+      GHCR_IMAGE: ghcr.io/${{ github.repository_owner }}/vaultwarden
+      SOURCE_REPOSITORY_URL: https://github.com/${{ github.repository }}
+      SOURCE_COMMIT: ${{ github.sha }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+          # Needed to push the version tag with GITHUB_TOKEN.
+          persist-credentials: true
+
+      - name: Determine version tags
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION_OVERRIDE: ${{ inputs.version || '' }}
+        run: |
+          chmod +x .github/scripts/determine-public-api-version.sh
+          .github/scripts/determine-public-api-version.sh
+
+      - name: Create or update git tag
+        if: github.event_name != 'workflow_dispatch' || inputs.dry_run == false
+        env:
+          IMAGE_TAG: ${{ steps.version.outputs.image_tag }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git rev-parse "refs/tags/${IMAGE_TAG}" >/dev/null 2>&1; then
+            CURRENT="$(git rev-list -n1 "refs/tags/${IMAGE_TAG}")"
+            if [[ "${CURRENT}" == "$(git rev-parse HEAD)" ]]; then
+              echo "Tag ${IMAGE_TAG} already points at HEAD"
+            else
+              echo "Moving tag ${IMAGE_TAG} to HEAD (was ${CURRENT})"
+              git tag -f "${IMAGE_TAG}" HEAD
+              git push -f origin "refs/tags/${IMAGE_TAG}"
+            fi
+          else
+            echo "Creating tag ${IMAGE_TAG}"
+            git tag "${IMAGE_TAG}" HEAD
+            git push origin "refs/tags/${IMAGE_TAG}"
+          fi
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+        with:
+          cache-binary: false
+          buildkitd-config-inline: |
+            [worker.oci]
+              max-parallelism = 2
+          driver-opts: |
+            network=host
+
+      - name: Login to GHCR
+        if: github.event_name != 'workflow_dispatch' || inputs.dry_run == false
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Bake and push debian/amd64 image
+        env:
+          IMAGE_TAG: ${{ steps.version.outputs.image_tag }}
+          FLOATING_TAG: ${{ steps.version.outputs.floating_tag }}
+          DRY_RUN: ${{ inputs.dry_run || false }}
+          SOURCE_COMMIT: ${{ env.SOURCE_COMMIT }}
+          SOURCE_REPOSITORY_URL: ${{ env.SOURCE_REPOSITORY_URL }}
+          GHCR_IMAGE: ${{ env.GHCR_IMAGE }}
+        run: |
+          set -euo pipefail
+          export SOURCE_VERSION="${IMAGE_TAG}"
+          export VW_VERSION="${IMAGE_TAG}"
+          export CONTAINER_REGISTRIES="${GHCR_IMAGE}"
+          export BASE_TAGS="${IMAGE_TAG},${FLOATING_TAG}"
+
+          OUTPUT="type=registry"
+          if [[ "${DRY_RUN}" == "true" ]]; then
+            OUTPUT="type=docker"
+          fi
+
+          docker buildx bake \
+            --progress plain \
+            --file docker/docker-bake.hcl \
+            --set "*.context=." \
+            --set "debian.platform=linux/amd64" \
+            --set "debian.tags=${GHCR_IMAGE}:${IMAGE_TAG},${GHCR_IMAGE}:${FLOATING_TAG}" \
+            --set "debian.output=${OUTPUT}" \
+            debian
+
+      - name: Summary
+        env:
+          IMAGE_TAG: ${{ steps.version.outputs.image_tag }}
+          FLOATING_TAG: ${{ steps.version.outputs.floating_tag }}
+          UPSTREAM_VERSION: ${{ steps.version.outputs.upstream_version }}
+          GHCR_IMAGE: ${{ env.GHCR_IMAGE }}
+          DRY_RUN: ${{ inputs.dry_run || false }}
+        run: |
+          {
+            echo "## Release Public API"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Upstream version | \`${UPSTREAM_VERSION}\` |"
+            echo "| Image tag | \`${GHCR_IMAGE}:${IMAGE_TAG}\` |"
+            echo "| Floating tag | \`${GHCR_IMAGE}:${FLOATING_TAG}\` |"
+            echo "| Commit | \`${GITHUB_SHA}\` |"
+            echo "| Dry run | \`${DRY_RUN}\` |"
+            echo ""
+            echo "Pull example:"
+            echo ""
+            echo '```bash'
+            echo "docker pull ${GHCR_IMAGE}:${IMAGE_TAG}"
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
