@@ -10,13 +10,13 @@ use rocket::{
 
 use crate::{
     CONFIG,
-    api::{core::log_event, EmptyResult, JsonResult},
+    api::{EmptyResult, JsonResult, core::log_event},
     auth,
     db::{
         DbConn,
         models::{
-            Collection, CollectionGroup, CollectionId, CollectionUser, EventType, Group, GroupId, GroupUser, Invitation,
-            Membership, MembershipId, MembershipStatus, MembershipType, Organization, OrganizationApiKey,
+            Collection, CollectionGroup, CollectionId, CollectionUser, EventType, Group, GroupId, GroupUser,
+            Invitation, Membership, MembershipId, MembershipStatus, MembershipType, Organization, OrganizationApiKey,
             OrganizationId, User, UserId,
         },
     },
@@ -357,11 +357,11 @@ async fn public_get_groups_data(details: bool, org_id: OrganizationId, conn: &Db
 
         if details {
             for g in groups {
-                groups_json.push(g.to_json_details(conn).await)
+                groups_json.push(g.to_json_details(conn).await);
             }
         } else {
             for g in groups {
-                groups_json.push(g.to_json())
+                groups_json.push(g.to_json());
             }
         }
         groups_json
@@ -460,7 +460,12 @@ async fn public_post_group(data: Json<PublicGroupRequest>, token: PublicToken, c
     }
 
     let group_request = data.into_inner();
-    let group = Group::new(org_id.clone(), group_request.name.clone(), group_request.access_all, group_request.external_id.clone());
+    let group = Group::new(
+        org_id.clone(),
+        group_request.name.clone(),
+        group_request.access_all,
+        group_request.external_id.clone(),
+    );
 
     // Note: Event logging without user context - using empty UserId for API calls
     log_event(
@@ -550,7 +555,7 @@ async fn public_get_group_members(group_id: GroupId, token: PublicToken, conn: D
 
     if Group::find_by_uuid_and_org(&group_id, &org_id, &conn).await.is_none() {
         err!("Group could not be found!", "Group uuid is invalid or does not belong to the organization")
-    };
+    }
 
     let group_members: Vec<MembershipId> = GroupUser::find_by_group(&group_id, &org_id, &conn)
         .await
@@ -575,7 +580,7 @@ async fn public_put_group_members(
 
     if Group::find_by_uuid_and_org(&group_id, &org_id, &conn).await.is_none() {
         err!("Group could not be found!", "Group uuid is invalid or does not belong to the organization")
-    };
+    }
 
     GroupUser::delete_all_by_group(&group_id, &org_id, &conn).await?;
 
@@ -624,9 +629,7 @@ async fn public_get_member(
     };
 
     let include_groups = data.include_groups.unwrap_or(false);
-    Ok(Json(
-        user.to_json_user_details(data.include_collections.unwrap_or(include_groups), include_groups, &conn).await
-    ))
+    Ok(Json(user.to_json_user_details(data.include_collections.unwrap_or(include_groups), include_groups, &conn).await))
 }
 
 #[post("/public/members/invite", data = "<data>")]
@@ -635,10 +638,10 @@ async fn public_post_members_invite(data: Json<PublicInviteData>, token: PublicT
     let data: PublicInviteData = data.into_inner();
 
     let raw_type = &data.r#type.into_string();
-    let new_type = match MembershipType::from_str(raw_type) {
-        Some(new_type) => new_type as i32,
-        None => err!("Invalid type"),
+    let Some(new_type) = MembershipType::from_str(raw_type) else {
+        err!("Invalid type")
     };
+    let new_type = new_type as i32;
 
     let access_all = new_type >= MembershipType::Admin
         || (raw_type.eq("4")
@@ -646,13 +649,13 @@ async fn public_post_members_invite(data: Json<PublicInviteData>, token: PublicT
             && data.permissions.get("deleteAnyCollection") == Some(&serde_json::json!(true))
             && data.permissions.get("createNewCollections") == Some(&serde_json::json!(true)));
 
-    let (org_name, org_email) = match Organization::find_by_uuid(&org_id, &conn).await {
-        Some(org) => (org.name, org.billing_email),
-        None => err!("Error looking up organization"),
+    let Some(org) = Organization::find_by_uuid(&org_id, &conn).await else {
+        err!("Error looking up organization")
     };
+    let (org_name, org_email) = (org.name, org.billing_email);
 
     let mut user_created: bool = false;
-    for email in data.emails.iter() {
+    for email in &data.emails {
         let mut member_status = MembershipStatus::Invited as i32;
         let user = match User::find_by_mail(email, &conn).await {
             None => {
@@ -676,12 +679,11 @@ async fn public_post_members_invite(data: Json<PublicInviteData>, token: PublicT
             Some(user) => {
                 if Membership::find_by_user_and_org(&user.uuid, &org_id, &conn).await.is_some() {
                     err!(format!("User already in organization: {email}"))
-                } else {
-                    if !CONFIG.mail_enabled() && !user.password_hash.is_empty() {
-                        member_status = MembershipStatus::Accepted as i32;
-                    }
-                    user
                 }
+                if !CONFIG.mail_enabled() && !user.password_hash.is_empty() {
+                    member_status = MembershipStatus::Accepted as i32;
+                }
+                user
             }
         };
 
@@ -691,18 +693,18 @@ async fn public_post_members_invite(data: Json<PublicInviteData>, token: PublicT
         new_member.status = member_status;
         new_member.save(&conn).await?;
 
-        if CONFIG.mail_enabled() {
-            if let Err(e) =
-                mail::send_invite(&user, org_id.clone(), new_member.uuid.clone(), &org_name, Some(org_email.clone())).await
-            {
-                if user_created {
-                    user.delete(&conn).await?;
-                } else {
-                    new_member.delete(&conn).await?;
-                }
-
-                err!(format!("Error sending invite: {e:?} "));
+        if CONFIG.mail_enabled()
+            && let Err(e) =
+                mail::send_invite(&user, org_id.clone(), new_member.uuid.clone(), &org_name, Some(org_email.clone()))
+                    .await
+        {
+            if user_created {
+                user.delete(&conn).await?;
+            } else {
+                new_member.delete(&conn).await?;
             }
+
+            err!(format!("Error sending invite: {e:?} "));
         }
 
         // Event logging
@@ -737,7 +739,7 @@ async fn public_post_members_invite(data: Json<PublicInviteData>, token: PublicT
             }
         }
 
-        for group_id in data.groups.iter() {
+        for group_id in &data.groups {
             let mut group_entry = GroupUser::new(group_id.clone(), new_member.uuid.clone());
             group_entry.save(&conn).await?;
         }
@@ -767,9 +769,8 @@ async fn public_put_member(
             && data.permissions.get("deleteAnyCollection") == Some(&serde_json::json!(true))
             && data.permissions.get("createNewCollections") == Some(&serde_json::json!(true)));
 
-    let mut member_to_edit = match Membership::find_by_uuid_and_org(&member_id, &org_id, &conn).await {
-        Some(member) => member,
-        None => err!("The specified user isn't member of the organization"),
+    let Some(mut member_to_edit) = Membership::find_by_uuid_and_org(&member_id, &org_id, &conn).await else {
+        err!("The specified user isn't member of the organization")
     };
 
     member_to_edit.access_all = access_all;
@@ -829,10 +830,11 @@ async fn public_delete_member(member_id: MembershipId, token: PublicToken, conn:
         err!("User to delete isn't member of the organization")
     };
 
-    if member_to_delete.atype == MembershipType::Owner && member_to_delete.status == MembershipStatus::Confirmed as i32 {
-        if Membership::count_confirmed_by_org_and_type(&org_id, MembershipType::Owner, &conn).await <= 1 {
-            err!("Can't delete the last owner")
-        }
+    if member_to_delete.atype == MembershipType::Owner
+        && member_to_delete.status == MembershipStatus::Confirmed as i32
+        && Membership::count_confirmed_by_org_and_type(&org_id, MembershipType::Owner, &conn).await <= 1
+    {
+        err!("Can't delete the last owner")
     }
 
     // Event logging
@@ -854,11 +856,8 @@ async fn public_delete_member(member_id: MembershipId, token: PublicToken, conn:
 #[get("/public/collections")]
 async fn public_get_collections(token: PublicToken, conn: DbConn) -> JsonResult {
     let org_id = token.0;
-    let collections: Vec<serde_json::Value> = Collection::find_by_organization(&org_id, &conn)
-        .await
-        .iter()
-        .map(|c| c.to_json())
-        .collect();
+    let collections: Vec<serde_json::Value> =
+        Collection::find_by_organization(&org_id, &conn).await.iter().map(Collection::to_json).collect();
 
     Ok(Json(serde_json::json!({
         "data": collections,
@@ -918,8 +917,15 @@ async fn public_post_collection(data: Json<PublicCollectionRequest>, token: Publ
             continue;
         }
 
-        CollectionUser::save(&member.user_uuid, &collection.uuid, user.read_only, user.hide_passwords, user.manage, &conn)
-            .await?;
+        CollectionUser::save(
+            &member.user_uuid,
+            &collection.uuid,
+            user.read_only,
+            user.hide_passwords,
+            user.manage,
+            &conn,
+        )
+        .await?;
     }
 
     // Return collection details (simplified, without user-specific details)
@@ -938,7 +944,7 @@ async fn public_put_collection(
 
     if Organization::find_by_uuid(&org_id, &conn).await.is_none() {
         err!("Can't find organization details")
-    };
+    }
 
     let Some(mut collection) = Collection::find_by_uuid_and_org(&collection_id, &org_id, &conn).await else {
         err!("Collection not found")
@@ -979,8 +985,15 @@ async fn public_put_collection(
             continue;
         }
 
-        CollectionUser::save(&member.user_uuid, &collection_id, user.read_only, user.hide_passwords, user.manage, &conn)
-            .await?;
+        CollectionUser::save(
+            &member.user_uuid,
+            &collection_id,
+            user.read_only,
+            user.hide_passwords,
+            user.manage,
+            &conn,
+        )
+        .await?;
     }
 
     Ok(Json(collection.to_json()))
