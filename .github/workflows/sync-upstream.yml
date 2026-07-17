@@ -151,7 +151,8 @@ jobs:
           && (github.event_name != 'workflow_dispatch' || inputs.dry_run == false)
           && steps.cifix.outputs.ci_ok == 'true'
         env:
-          GH_TOKEN: ${{ github.token }}
+          # Prefer a PAT so PR create/auto-merge works; GITHUB_TOKEN often cannot createPullRequest.
+          GH_TOKEN: ${{ secrets.SYNC_GITHUB_TOKEN || github.token }}
           FEATURE_BRANCH: feature-public-api
           SYNC_BRANCH: sync/upstream-public-api
           UPSTREAM_SHA: ${{ steps.sync.outputs.upstream_sha || steps.sync_fix.outputs.upstream_sha }}
@@ -194,6 +195,7 @@ jobs:
 
           - Strategy is **merge** (not rebase) so this PR stays reviewable.
           - Cursor resolves merge conflicts and auto-fixes fmt/clippy/typos before publish.
+          - Auto-merge is enabled; GitHub merges when required checks are green.
           - Fork \`.github/workflows\` are retained on purpose: \`GITHUB_TOKEN\` cannot push workflow file updates.
 
           ## Test plan
@@ -204,18 +206,42 @@ jobs:
           )"
           PR_BODY="$(sed -e 's/^          //' <<<"${PR_BODY}")"
 
-          EXISTING_PR="$(gh pr list --base "${FEATURE_BRANCH}" --head "${SYNC_BRANCH}" --state open --json number --jq '.[0].number // empty')"
-          if [[ -n "${EXISTING_PR}" ]]; then
-            echo "Updating existing PR #${EXISTING_PR}"
-            gh pr edit "${EXISTING_PR}" --title "${PR_TITLE}" --body "${PR_BODY}" || true
-            echo "pr_number=${EXISTING_PR}" >> "${GITHUB_OUTPUT}"
+          PR_NUM="$(gh pr list --base "${FEATURE_BRANCH}" --head "${SYNC_BRANCH}" --state open --json number --jq '.[0].number // empty')"
+          if [[ -z "${PR_NUM}" ]]; then
+            CLOSED_PR="$(gh pr list --base "${FEATURE_BRANCH}" --head "${SYNC_BRANCH}" --state closed --json number --jq '.[0].number // empty')"
+            if [[ -n "${CLOSED_PR}" ]]; then
+              echo "Reopening closed PR #${CLOSED_PR}"
+              if gh pr reopen "${CLOSED_PR}"; then
+                PR_NUM="${CLOSED_PR}"
+              fi
+            fi
+          fi
+
+          if [[ -n "${PR_NUM}" ]]; then
+            echo "Updating existing PR #${PR_NUM}"
+            gh pr edit "${PR_NUM}" --title "${PR_TITLE}" --body "${PR_BODY}" || true
+            echo "pr_number=${PR_NUM}" >> "${GITHUB_OUTPUT}"
           else
             echo "Creating PR"
             if PR_URL="$(gh pr create --base "${FEATURE_BRANCH}" --head "${SYNC_BRANCH}" --title "${PR_TITLE}" --body "${PR_BODY}")"; then
               echo "PR: ${PR_URL}"
               echo "pr_url=${PR_URL}" >> "${GITHUB_OUTPUT}"
+              PR_NUM="$(gh pr list --base "${FEATURE_BRANCH}" --head "${SYNC_BRANCH}" --state open --json number --jq '.[0].number // empty')"
+              echo "pr_number=${PR_NUM}" >> "${GITHUB_OUTPUT}"
             else
-              echo "PR create failed (token permissions). Branch was pushed: ${SYNC_BRANCH}"
+              echo "PR create failed. Set repo secret SYNC_GITHUB_TOKEN (classic PAT with 'repo') for PR create/auto-merge."
+              echo "Branch was pushed: ${SYNC_BRANCH}"
+              PR_NUM=""
+            fi
+          fi
+
+          if [[ -n "${PR_NUM}" ]]; then
+            echo "Enabling auto-merge for PR #${PR_NUM}"
+            if gh pr merge "${PR_NUM}" --auto --merge; then
+              echo "auto_merge=true" >> "${GITHUB_OUTPUT}"
+            else
+              echo "Auto-merge could not be enabled (check Allow auto-merge + ruleset + SYNC_GITHUB_TOKEN)."
+              echo "auto_merge=false" >> "${GITHUB_OUTPUT}"
             fi
           fi
 
@@ -233,6 +259,7 @@ jobs:
           SYNC_BRANCH: sync/upstream-public-api
           PR_NUMBER: ${{ steps.publish.outputs.pr_number }}
           PR_URL: ${{ steps.publish.outputs.pr_url }}
+          AUTO_MERGE: ${{ steps.publish.outputs.auto_merge }}
           DRY_RUN: ${{ inputs.dry_run || false }}
         run: |
           {
@@ -251,4 +278,5 @@ jobs:
             echo "| Sync branch | \`${SYNC_BRANCH}\` |"
             echo "| Dry run | \`${DRY_RUN}\` |"
             echo "| PR | ${PR_URL:-${PR_NUMBER:-n/a}} |"
+            echo "| Auto-merge | \`${AUTO_MERGE:-n/a}\` |"
           } >> "${GITHUB_STEP_SUMMARY}"
