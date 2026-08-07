@@ -23,6 +23,15 @@ jobs:
           driver-opts: |
             network=host
 
+      # Download hadolint - https://github.com/hadolint/hadolint/releases
+      - name: Download hadolint
+        shell: bash
+        run: |
+          sudo curl -L https://github.com/hadolint/hadolint/releases/download/v${HADOLINT_VERSION}/hadolint-$(uname -s)-$(uname -m) -o /usr/local/bin/hadolint && \
+          sudo chmod +x /usr/local/bin/hadolint
+        env:
+          HADOLINT_VERSION: 2.14.0
+      # End Download hadolint
       # Checkout the repo
       - name: Checkout
         uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 #v6.0.0
@@ -31,17 +40,9 @@ jobs:
       # End Checkout the repo
 
       # Test Dockerfiles with hadolint
-      # Uses the Docker-based action (hadolint pre-bundled in ghcr.io/hadolint/hadolint:v2.14.0-debian)
-      # so no binary is downloaded at runtime. Pinned by commit SHA for supply-chain safety.
-      - name: Run hadolint on Dockerfile.debian
-        uses: hadolint/hadolint-action@2a66e89f53d0771bb131a7fa31f3136336094aa6 # v3.4.0
-        with:
-          dockerfile: docker/Dockerfile.debian
-
-      - name: Run hadolint on Dockerfile.alpine
-        uses: hadolint/hadolint-action@2a66e89f53d0771bb131a7fa31f3136336094aa6 # v3.4.0
-        with:
-          dockerfile: docker/Dockerfile.alpine
+      - name: Run hadolint
+        shell: bash
+        run: hadolint docker/Dockerfile.{debian,alpine}
       # End Test Dockerfiles with hadolint
 
       # Test Dockerfiles with docker build checks
