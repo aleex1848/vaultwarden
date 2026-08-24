@@ -262,10 +262,14 @@ jobs:
           && steps.sync.outputs.changed == 'false'
           && (github.event_name != 'workflow_dispatch' || inputs.dry_run == false)
         env:
-          GH_TOKEN: ${{ secrets.SYNC_GITHUB_TOKEN || github.token }}
+          # Use GITHUB_TOKEN (actions:write) so workflow lookup/dispatch works.
+          # SYNC_GITHUB_TOKEN may lack Actions permissions and fail with
+          # "could not find any workflows named ...".
+          GH_TOKEN: ${{ github.token }}
           FEATURE_BRANCH: feature-public-api
           UPSTREAM_REPO: dani-garcia/vaultwarden
-          RELEASE_WORKFLOW: Release Public API
+          RELEASE_WORKFLOW: release-public-api.yml
+          REPO: ${{ github.repository }}
           DRY_RUN: ${{ inputs.dry_run || false }}
         run: |
           chmod +x .github/scripts/ensure-public-api-release.sh

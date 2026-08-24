@@ -6,8 +6,9 @@ set -euo pipefail
 
 UPSTREAM_REPO="${UPSTREAM_REPO:-dani-garcia/vaultwarden}"
 FEATURE_BRANCH="${FEATURE_BRANCH:-feature-public-api}"
-RELEASE_WORKFLOW="${RELEASE_WORKFLOW:-Release Public API}"
+RELEASE_WORKFLOW="${RELEASE_WORKFLOW:-release-public-api.yml}"
 DRY_RUN="${DRY_RUN:-false}"
+REPO="${REPO:-${GITHUB_REPOSITORY:-}}"
 
 log() { printf '==> %s\n' "$*"; }
 
@@ -84,7 +85,12 @@ if [[ "${DRY_RUN}" == "true" ]]; then
 fi
 
 log "Triggering workflow '${RELEASE_WORKFLOW}' on ${FEATURE_BRANCH} (version=${UPSTREAM_VERSION})"
+GH_ARGS=()
+if [[ -n "${REPO}" ]]; then
+  GH_ARGS+=(--repo "${REPO}")
+fi
 gh workflow run "${RELEASE_WORKFLOW}" \
+  "${GH_ARGS[@]}" \
   --ref "${FEATURE_BRANCH}" \
   -f "version=${UPSTREAM_VERSION}" \
   -f "dry_run=false"
