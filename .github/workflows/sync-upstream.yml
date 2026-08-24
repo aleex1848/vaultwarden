@@ -1,5 +1,6 @@
 name: Sync Upstream
 permissions:
+  actions: write
   contents: write
   pull-requests: write
 
@@ -39,6 +40,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     permissions:
+      actions: write
       contents: write
       pull-requests: write
     env:
@@ -251,6 +253,24 @@ jobs:
             fi
           fi
 
+      # When feature-public-api already has upstream commits but upstream only tagged a
+      # release later, nothing merges — still publish the matching *-public-api image/tag.
+      - name: Ensure fork release for latest upstream
+        id: ensure_release
+        if: >
+          env.MODE == 'sync'
+          && steps.sync.outputs.changed == 'false'
+          && (github.event_name != 'workflow_dispatch' || inputs.dry_run == false)
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_GITHUB_TOKEN || github.token }}
+          FEATURE_BRANCH: feature-public-api
+          UPSTREAM_REPO: dani-garcia/vaultwarden
+          RELEASE_WORKFLOW: Release Public API
+          DRY_RUN: ${{ inputs.dry_run || false }}
+        run: |
+          chmod +x .github/scripts/ensure-public-api-release.sh
+          .github/scripts/ensure-public-api-release.sh
+
       - name: Summary
         if: always()
         env:
@@ -267,6 +287,10 @@ jobs:
           PR_URL: ${{ steps.publish.outputs.pr_url }}
           AUTO_MERGE: ${{ steps.publish.outputs.auto_merge }}
           DRY_RUN: ${{ inputs.dry_run || false }}
+          RELEASE_NEEDED: ${{ steps.ensure_release.outputs.needed }}
+          RELEASE_TRIGGERED: ${{ steps.ensure_release.outputs.triggered }}
+          RELEASE_TAG: ${{ steps.ensure_release.outputs.image_tag }}
+          RELEASE_REASON: ${{ steps.ensure_release.outputs.reason }}
         run: |
           {
             echo "## Sync Upstream"
@@ -285,4 +309,8 @@ jobs:
             echo "| Dry run | \`${DRY_RUN}\` |"
             echo "| PR | ${PR_URL:-${PR_NUMBER:-n/a}} |"
             echo "| Auto-merge | \`${AUTO_MERGE:-n/a}\` |"
+            echo "| Release needed | \`${RELEASE_NEEDED:-n/a}\` |"
+            echo "| Release triggered | \`${RELEASE_TRIGGERED:-n/a}\` |"
+            echo "| Release tag | \`${RELEASE_TAG:-n/a}\` |"
+            echo "| Release reason | \`${RELEASE_REASON:-n/a}\` |"
           } >> "${GITHUB_STEP_SUMMARY}"
