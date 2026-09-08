@@ -130,18 +130,16 @@ jobs:
           prefix-key: "v2025.09-rust-sync"
           shared-key: "sync-sqlite-clippy"
 
-      - name: cargo check (sqlite)
-        if: env.MODE == 'sync' && steps.sync.outputs.changed == 'true'
-        run: cargo check --features sqlite
-
-      - name: Auto-fix fmt/clippy/typos with Cursor
+      # Compile + fmt/clippy/typos live inside the Cursor loop so type/API
+      # breakages after upstream merge get auto-fixed (no hard fail before agent).
+      - name: Auto-fix compile/fmt/clippy/typos with Cursor
         id: cifix
         if: (env.MODE == 'fix-ci') || (steps.sync.outputs.changed == 'true')
         env:
           CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
           PROMPT_FILE: .github/prompts/fix-ci-public-api.md
           CURSOR_MODEL: ${{ inputs.cursor_model || 'composer-2.5' }}
-          MAX_CI_FIX_ROUNDS: "5"
+          MAX_CI_FIX_ROUNDS: "8"
         run: |
           chmod +x .github/scripts/fix-ci-with-cursor.sh
           .github/scripts/fix-ci-with-cursor.sh

@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# Run fmt/clippy/typos; on failure, ask Cursor CLI to fix and retry.
+# Run compile + fmt/clippy/typos; on failure, ask Cursor CLI to fix and retry.
 set -euo pipefail
 
 PROMPT_FILE="${PROMPT_FILE:-.github/prompts/fix-ci-public-api.md}"
 CURSOR_MODEL="${CURSOR_MODEL:-composer-2.5}"
-MAX_ROUNDS="${MAX_CI_FIX_ROUNDS:-5}"
+MAX_ROUNDS="${MAX_CI_FIX_ROUNDS:-8}"
 CLIPPY_FEATURES="${CLIPPY_FEATURES:-sqlite,mysql,postgresql,enable_mimalloc,s3}"
+CHECK_FEATURES="${CHECK_FEATURES:-sqlite}"
 
 log() { printf '==> %s\n' "$*"; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -30,6 +31,12 @@ run_checks() {
   local log_file="$1"
   : > "${log_file}"
   local rc=0
+
+  # Compile first so Cursor sees type/API breakages from upstream merges.
+  {
+    echo "### cargo check"
+    cargo check --features "${CHECK_FEATURES}"
+  } >>"${log_file}" 2>&1 || rc=1
 
   {
     echo "### cargo fmt"
@@ -89,7 +96,7 @@ LOG_FILE="$(mktemp)"
 trap 'rm -f "${LOG_FILE}"' EXIT
 
 if run_checks "${LOG_FILE}"; then
-  log "fmt/clippy/typos already green"
+  log "compile/fmt/clippy/typos already green"
   write_output "ci_fixed" "false"
   write_output "ci_ok" "true"
   exit 0
@@ -101,7 +108,7 @@ FIXES_APPLIED="true"
 round=1
 while (( round <= MAX_ROUNDS )); do
   log "Cursor CI-fix round ${round}/${MAX_ROUNDS}"
-  FAIL_LOG="$(tail -n 200 "${LOG_FILE}")"
+  FAIL_LOG="$(tail -n 300 "${LOG_FILE}")"
   PROMPT="$(cat "${PROMPT_FILE}")
 
 ---
