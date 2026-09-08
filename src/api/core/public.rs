@@ -373,7 +373,7 @@ async fn public_get_groups_data(details: bool, org_id: OrganizationId, conn: &Db
         }
         groups_json
     } else {
-        Vec::with_capacity(0)
+        Vec::new()
     };
 
     Ok(Json(serde_json::json!({
@@ -476,7 +476,7 @@ async fn public_post_group(data: Json<PublicGroupRequest>, token: PublicToken, c
 
     // Note: Event logging without user context - using empty UserId for API calls
     log_event(
-        EventType::GroupCreated as i32,
+        EventType::GroupCreated,
         &group.uuid,
         &org_id,
         &UserId::from("00000000-0000-0000-0000-000000000000"),
@@ -514,7 +514,7 @@ async fn public_put_group(
 
     // Note: Event logging without user context
     log_event(
-        EventType::GroupUpdated as i32,
+        EventType::GroupUpdated,
         &group.uuid,
         &org_id,
         &UserId::from("00000000-0000-0000-0000-000000000000"),
@@ -540,7 +540,7 @@ async fn public_delete_group(group_id: GroupId, token: PublicToken, conn: DbConn
 
     // Note: Event logging without user context
     log_event(
-        EventType::GroupDeleted as i32,
+        EventType::GroupDeleted,
         &group.uuid,
         &org_id,
         &UserId::from("00000000-0000-0000-0000-000000000000"),
@@ -716,7 +716,7 @@ async fn public_post_members_invite(data: Json<PublicInviteData>, token: PublicT
 
         // Event logging
         log_event(
-            EventType::OrganizationUserInvited as i32,
+            EventType::OrganizationUserInvited,
             &new_member.uuid,
             &org_id,
             &UserId::from("00000000-0000-0000-0000-000000000000"),
@@ -817,7 +817,7 @@ async fn public_put_member(
 
     // Event logging
     log_event(
-        EventType::OrganizationUserUpdated as i32,
+        EventType::OrganizationUserUpdated,
         &member_to_edit.uuid,
         &org_id,
         &UserId::from("00000000-0000-0000-0000-000000000000"),
@@ -846,7 +846,7 @@ async fn public_delete_member(member_id: MembershipId, token: PublicToken, conn:
 
     // Event logging
     log_event(
-        EventType::OrganizationUserRemoved as i32,
+        EventType::OrganizationUserRemoved,
         &member_to_delete.uuid,
         &org_id,
         &UserId::from("00000000-0000-0000-0000-000000000000"),
@@ -897,7 +897,7 @@ async fn public_post_collection(data: Json<PublicCollectionRequest>, token: Publ
 
     // Event logging
     log_event(
-        EventType::CollectionCreated as i32,
+        EventType::CollectionCreated,
         &collection.uuid,
         &org_id,
         &UserId::from("00000000-0000-0000-0000-000000000000"),
@@ -963,7 +963,7 @@ async fn public_put_collection(
 
     // Event logging
     log_event(
-        EventType::CollectionUpdated as i32,
+        EventType::CollectionUpdated,
         &collection.uuid,
         &org_id,
         &UserId::from("00000000-0000-0000-0000-000000000000"),
@@ -1015,7 +1015,7 @@ async fn public_delete_collection(collection_id: CollectionId, token: PublicToke
 
     // Event logging
     log_event(
-        EventType::CollectionDeleted as i32,
+        EventType::CollectionDeleted,
         &collection.uuid,
         &org_id,
         &UserId::from("00000000-0000-0000-0000-000000000000"),
