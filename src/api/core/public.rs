@@ -607,7 +607,7 @@ async fn public_get_members(data: PublicGetOrgUserData, token: PublicToken, conn
     let mut users_json = Vec::new();
     for u in Membership::find_by_org(&org_id, &conn).await {
         users_json.push(
-            u.to_json_user_details(
+            u.to_json_details_for_admin(
                 data.include_collections.unwrap_or(false),
                 data.include_groups.unwrap_or(false),
                 &conn,
@@ -636,7 +636,9 @@ async fn public_get_member(
     };
 
     let include_groups = data.include_groups.unwrap_or(false);
-    Ok(Json(user.to_json_user_details(data.include_collections.unwrap_or(include_groups), include_groups, &conn).await))
+    Ok(Json(
+        user.to_json_details_for_admin(data.include_collections.unwrap_or(include_groups), include_groups, &conn).await,
+    ))
 }
 
 #[post("/public/members/invite", data = "<data>")]
