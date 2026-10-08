@@ -1430,7 +1430,10 @@ pub const SUPPORTED_FEATURE_FLAGS: &[&str] = &[
     "undetermined-cipher-scenario-logic",
     "enable-basic-auth-response",
     "ssh-agent-v2",
+    "windows-desktop-autotype",
+    "windows-desktop-autotype-ga",
     // Key Management Team
+    "biometrics-sdk-ipc",
     "windows-native-credential-sync",
     // Mobile Team
     "pm-34171-card-scanner",
