@@ -204,7 +204,7 @@ jobs:
 
       - name: Bake ${{ matrix.base_image }} containers
         id: bake_vw
-        uses: docker/bake-action@5be5f02ff8819ecd3092ea6b2e6261c31774f2b4 # v6.10.0
+        uses: docker/bake-action@59cb1203cd42bcefd40a1b6d73b589e48c86040e # v7.5.0
         env:
           BASE_TAGS: "${{ steps.determine-version.outputs.BASE_TAGS }}"
           SOURCE_COMMIT: "${{ env.SOURCE_COMMIT }}"
@@ -240,7 +240,7 @@ jobs:
           touch "${RUNNER_TEMP}/digests/${digest#sha256:}"
 
       - name: Upload digest
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: digests-${{ env.NORMALIZED_ARCH }}-${{ matrix.base_image }}
           path: ${{ runner.temp }}/digests/*
@@ -282,7 +282,7 @@ jobs:
           subject-path: vaultwarden-${{ env.NORMALIZED_ARCH }}
 
       - name: Upload binaries as artifacts
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: vaultwarden-${{ env.SOURCE_VERSION }}-linux-${{ env.NORMALIZED_ARCH }}-${{ matrix.base_image }}
           path: vaultwarden-${{ env.NORMALIZED_ARCH }}
@@ -306,7 +306,7 @@ jobs:
 
     steps:
       - name: Download digests
-        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: ${{ runner.temp }}/digests
           pattern: digests-*-${{ matrix.base_image }}
