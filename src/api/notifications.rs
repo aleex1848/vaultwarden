@@ -212,7 +212,7 @@ fn websockets_hub<'r>(
                         if last_received.elapsed() > WS_CLIENT_TIMEOUT {
                             break;
                         }
-                        yield Message::Ping(create_ping());
+                        yield Message::Ping(PING.to_vec());
                     }
                 }
             }
@@ -295,7 +295,7 @@ fn anonymous_websockets_hub<'r>(ws: WebSocket, token: String, ip: ClientIp) -> R
                         if last_received.elapsed() > WS_CLIENT_TIMEOUT {
                             break;
                         }
-                        yield Message::Ping(create_ping());
+                        yield Message::Ping(PING.to_vec());
                     }
                 }
             }
@@ -359,6 +359,7 @@ fn convert_option<T: Into<Value>>(option: Option<T>) -> Value {
 
 const RECORD_SEPARATOR: u8 = 0x1e;
 const INITIAL_RESPONSE: [u8; 3] = [0x7b, 0x7d, RECORD_SEPARATOR]; // {, }, <RS>
+const PING: [u8; 3] = [0x02, 0x91, 0x06];
 
 #[derive(Deserialize, Copy, Clone, Eq, PartialEq)]
 struct InitialMessage<'a> {
@@ -411,23 +412,35 @@ impl WebSocketUsers {
     }
 
     pub async fn send_logout(&self, user: &User, acting_device: Option<&Device>, conn: &DbConn) {
+        self.send_logout_with_reason(user, acting_device, None, conn).await;
+    }
+
+    /// A logout that clients may handle differently depending on `reason`
+    pub async fn send_logout_with_reason(
+        &self,
+        user: &User,
+        acting_device: Option<&Device>,
+        reason: Option<LogOutReason>,
+        conn: &DbConn,
+    ) {
         // Skip any processing if both WebSockets and Push are not active
         if *NOTIFICATIONS_DISABLED {
             return;
         }
         let acting_device_id = acting_device.map(|d| d.uuid.clone());
-        let data = create_update(
-            vec![("UserId".into(), user.uuid.to_string().into()), ("Date".into(), serialize_date(user.updated_at))],
-            UpdateType::LogOut,
-            acting_device_id,
-        );
+        let mut payload =
+            vec![("UserId".into(), user.uuid.to_string().into()), ("Date".into(), serialize_date(user.updated_at))];
+        if let Some(reason) = reason {
+            payload.push(("Reason".into(), (reason as i32).into()));
+        }
+        let data = create_update(payload, UpdateType::LogOut, acting_device_id);
 
         if CONFIG.enable_websocket() {
             self.send_update(&user.uuid, &data).await;
         }
 
         if CONFIG.push_enabled() {
-            push_logout(user, acting_device, conn).await;
+            push_logout(user, acting_device, reason, conn).await;
         }
     }
 
@@ -691,8 +704,12 @@ fn create_anonymous_update(payload: Vec<(Value, Value)>, ut: UpdateType, user_id
     serialize(&value)
 }
 
-fn create_ping() -> Vec<u8> {
-    serialize(&Value::Array(vec![6.into()]))
+/// Why a logout was pushed, absent for a plain one. `KdfChange` isn't sent yet.
+///
+/// Ref: <https://github.com/bitwarden/server/blob/9030c42bf7d8f9ac2ff9fee85c39588d5eb81499/src/Core/Enums/PushNotificationLogOutReason.cs#L3-L7>
+#[derive(Copy, Clone, Eq, PartialEq)]
+pub enum LogOutReason {
+    KeyRotation = 1,
 }
 
 // https://github.com/bitwarden/server/blob/375af7c43b10d9da03525d41452f95de3f921541/src/Core/Enums/PushType.cs

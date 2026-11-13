@@ -8,17 +8,18 @@ use crate::{
     CONFIG,
     api::admin::FAKE_ADMIN_UUID,
     api::{
-        EmptyResult, JsonResult, Notify, PasswordOrOtpData, UpdateType,
+        ApiResult, EmptyResult, JsonResult, Notify, PasswordOrOtpData, UpdateType,
         core::{CipherSyncData, CipherSyncType, accept_org_invite, log_event, two_factor},
     },
     auth::{AdminHeaders, Headers, ManagerHeaders, ManagerHeadersLoose, OrgMemberHeaders, OwnerHeaders, decode_invite},
     db::{
         DbConn,
         models::{
-            Cipher, CipherId, Collection, CollectionCipher, CollectionGroup, CollectionId, CollectionUser, Device,
-            EventType, Group, GroupId, GroupUser, Invitation, Membership, MembershipId, MembershipStatus,
-            MembershipType, OrgPolicy, OrgPolicyType, Organization, OrganizationApiKey, OrganizationId, TwoFactor,
-            TwoFactorType, User, UserId,
+            Cipher, CipherAccessScope, CipherId, Collection, CollectionCipher, CollectionGroup, CollectionId,
+            CollectionUser, CustomPermission, Device, EventType, FillAssistPolicyData, Group, GroupId, GroupUser,
+            Invitation, Membership, MembershipId, MembershipStatus, MembershipType, OrgPolicy, OrgPolicyType,
+            Organization, OrganizationApiKey, OrganizationId, TwoFactor, TwoFactorType, User, UserId,
+            custom_roles_enabled,
         },
     },
     mail,
@@ -47,6 +48,7 @@ pub fn routes() -> Vec<Route> {
         bulk_delete_organization_collections,
         post_bulk_collections,
         get_org_details,
+        get_assigned_org_details,
         get_org_domain_sso_verified,
         get_members,
         send_invite,
@@ -131,13 +133,16 @@ impl FullCollectionData {
         let org_groups = Group::find_by_organization(org_id, conn).await;
         let org_group_ids: HashSet<&GroupId> = org_groups.iter().map(|c| &c.uuid).collect();
         if let Some(e) = self.groups.iter().find(|g| !org_group_ids.contains(&g.id)) {
-            err!("Invalid group", format!("Group {} does not belong to organization {}!", e.id, org_id))
+            err!("Invalid group", format!("Group {} does not belong to organization {}!", e.id.escape_debug(), org_id))
         }
 
         let org_memberships = Membership::find_by_org(org_id, conn).await;
         let org_membership_ids: HashSet<&MembershipId> = org_memberships.iter().map(|m| &m.uuid).collect();
         if let Some(e) = self.users.iter().find(|m| !org_membership_ids.contains(&m.id)) {
-            err!("Invalid member", format!("Member {} does not belong to organization {}!", e.id, org_id))
+            err!(
+                "Invalid member",
+                format!("Member {} does not belong to organization {}!", e.id.escape_debug(), org_id)
+            )
         }
 
         Ok(())
@@ -552,7 +557,7 @@ async fn post_bulk_access_collections(
     let org_groups = Group::find_by_organization(&org_id, &conn).await;
     let org_group_ids: HashSet<&GroupId> = org_groups.iter().map(|g| &g.uuid).collect();
     if let Some(g) = data.groups.iter().find(|g| !org_group_ids.contains(&g.id)) {
-        err!("Invalid group", format!("Group {} does not belong to organization {}!", g.id, org_id))
+        err!("Invalid group", format!("Group {} does not belong to organization {}!", g.id.escape_debug(), org_id))
     }
 
     for col_id in data.collection_ids {
@@ -838,7 +843,7 @@ async fn get_org_details(data: OrgIdData, headers: ManagerHeadersLoose, conn: Db
         err_code!("Resource not found.", "Organization id's do not match", Status::NotFound.code);
     }
 
-    if !headers.membership.has_full_access() {
+    if !headers.membership.can_edit_any_collection() {
         err_code!("Resource not found.", "User does not have full access", Status::NotFound.code);
     }
 
@@ -856,13 +861,51 @@ async fn get_org_details_impl(
     conn: &DbConn,
 ) -> Result<Value, crate::Error> {
     let ciphers = Cipher::find_by_org(org_id, conn).await;
-    let cipher_sync_data = CipherSyncData::new(user_id, CipherSyncType::Organization, conn).await;
+    let mut cipher_sync_data = CipherSyncData::new(user_id, CipherSyncType::Organization, conn).await;
+    // Every cipher of the organization is listed, so list every collection of them too
+    cipher_sync_data.cipher_collections = HashMap::new();
+    for (cipher_id, collection_id) in Cipher::get_collections_with_cipher_by_organization(org_id, conn).await {
+        cipher_sync_data.cipher_collections.entry(cipher_id).or_default().push(collection_id);
+    }
 
     let mut ciphers_json = Vec::with_capacity(ciphers.len());
     for c in ciphers {
         ciphers_json.push(c.to_json(host, user_id, Some(&cipher_sync_data), CipherSyncType::Organization, conn).await?);
     }
     Ok(json!(ciphers_json))
+}
+
+// The Admin Console lists these instead of every cipher of the organization for a member who may not edit every
+// cipher, like a Custom member with Delete any collection only. As in Bitwarden, any confirmed member may list them.
+#[get("/ciphers/organization-details/assigned?<data..>")]
+async fn get_assigned_org_details(data: OrgIdData, headers: Headers, conn: DbConn) -> JsonResult {
+    let Some(member) =
+        Membership::find_confirmed_by_user_and_org(&headers.user.uuid, &data.organization_id, &conn).await
+    else {
+        err_code!("Resource not found.", "User is not a confirmed member of the organization", Status::NotFound.code);
+    };
+
+    let (assigned, unassigned) = Cipher::find_assigned_to_member(&member, &conn).await;
+    let mut ciphers_json = Vec::with_capacity(assigned.len() + unassigned.len());
+    // The ciphers of the member's own vault, as they are there
+    let cipher_sync_data = CipherSyncData::new(&headers.user.uuid, CipherSyncType::User, &conn).await;
+    for cipher in assigned {
+        ciphers_json.push(
+            cipher
+                .to_json(&headers.host, &headers.user.uuid, Some(&cipher_sync_data), CipherSyncType::User, &conn)
+                .await?,
+        );
+    }
+    // The ciphers in no collection, as the member may use them in the Admin Console
+    for cipher in unassigned {
+        ciphers_json.push(cipher.to_json_org_admin(&headers.host, &headers.user.uuid, &conn).await?);
+    }
+
+    Ok(Json(json!({
+        "data": ciphers_json,
+        "object": "list",
+        "continuationToken": null,
+    })))
 }
 
 // Returning a Domain/Organization here allow to prefill it and prevent prompting the user
@@ -975,13 +1018,16 @@ impl InviteData {
         let org_collections = Collection::find_by_organization(org_id, conn).await;
         let org_collection_ids: HashSet<&CollectionId> = org_collections.iter().map(|c| &c.uuid).collect();
         if let Some(e) = self.collections.iter().flatten().find(|c| !org_collection_ids.contains(&c.id)) {
-            err!("Invalid collection", format!("Collection {} does not belong to organization {}!", e.id, org_id))
+            err!(
+                "Invalid collection",
+                format!("Collection {} does not belong to organization {}!", e.id.escape_debug(), org_id)
+            )
         }
 
         let org_groups = Group::find_by_organization(org_id, conn).await;
         let org_group_ids: HashSet<&GroupId> = org_groups.iter().map(|c| &c.uuid).collect();
         if let Some(e) = self.groups.iter().find(|g| !org_group_ids.contains(g)) {
-            err!("Invalid group", format!("Group {} does not belong to organization {}!", e, org_id))
+            err!("Invalid group", format!("Group {} does not belong to organization {}!", e.escape_debug(), org_id))
         }
 
         Ok(())
@@ -1002,14 +1048,12 @@ async fn send_invite(
     data.validate(&org_id, &conn).await?;
 
     // HACK: We need the raw user-type to be sure custom role is selected to determine the access_all permission
-    // The from_str() will convert the custom role type into a manager role type
+    // Unless Custom roles are enabled, a custom role (4) is converted to a manager role (3)
     let raw_type = &data.r#type.into_string();
-    // Membership::from_str will convert custom (4) to manager (3)
-    let new_type = if let Some(new_type) = MembershipType::from_str(raw_type) {
-        new_type as i32
-    } else {
+    let Some(requested_type) = MembershipType::from_str(raw_type) else {
         err!("Invalid type")
     };
+    let new_type = MembershipType::requested(requested_type, None, custom_roles_enabled());
 
     if new_type != MembershipType::User && headers.membership_type != MembershipType::Owner {
         err!("Only Owners can invite Managers, Admins or Owners")
@@ -1019,10 +1063,18 @@ async fn send_invite(
     // Since the parent checkbox is not sent to the server we need to check and verify the child checkboxes
     // If the box is not checked, the user will still be a manager, but not with the access_all permission
     let access_all = new_type >= MembershipType::Admin
-        || (raw_type.eq("4")
+        || (new_type == MembershipType::Manager
+            && raw_type.eq("4")
             && data.permissions.get("editAnyCollection") == Some(&json!(true))
             && data.permissions.get("deleteAnyCollection") == Some(&json!(true))
             && data.permissions.get("createNewCollections") == Some(&json!(true)));
+
+    // Checked before anything is created, so a rejected permission leaves nothing behind
+    let custom_permissions = if new_type == MembershipType::Custom {
+        Some(CustomPermission::requested(&data.permissions)?)
+    } else {
+        None
+    };
 
     let mut user_created: bool;
     for email in &data.emails {
@@ -1065,8 +1117,11 @@ async fn send_invite(
         };
 
         let mut new_member = Membership::new(user.uuid.clone(), org_id.clone(), Some(headers.user.email.clone()));
+        new_member.set_type(new_type);
         new_member.access_all = access_all;
-        new_member.atype = new_type;
+        if let Some(permissions) = &custom_permissions {
+            new_member.set_custom_permissions(permissions);
+        }
         new_member.status = member_status;
         new_member.save(&conn).await?;
 
@@ -1156,7 +1211,10 @@ async fn bulk_reinvite_members(
     for member_id in data.ids {
         let err_msg = match reinvite_member_impl(&org_id, &member_id, &headers.user.email, &conn).await {
             Ok(()) => String::new(),
-            Err(e) => format!("{e:?}"),
+            Err(e) => {
+                warn!("Unable to reinvite member {}: {e:?}", member_id.escape_debug());
+                e.message().to_owned()
+            }
         };
 
         bulk_response.push(json!(
@@ -1329,7 +1387,10 @@ async fn bulk_confirm_invite(
                 let user_key = invite.key.unwrap_or_default();
                 let err_msg = match confirm_invite_impl(&org_id, &member_id, &user_key, &headers, &conn, &nt).await {
                     Ok(()) => String::new(),
-                    Err(e) => format!("{e:?}"),
+                    Err(e) => {
+                        warn!("Unable to confirm member {}: {e:?}", member_id.escape_debug());
+                        e.message().to_owned()
+                    }
                 };
 
                 bulk_response.push(json!(
@@ -1496,24 +1557,32 @@ async fn edit_member(
     let data: EditUserData = data.into_inner();
 
     // HACK: We need the raw user-type to be sure custom role is selected to determine the access_all permission
-    // The from_str() will convert the custom role type into a manager role type
+    // Unless Custom roles are enabled, a custom role (4) is converted to a manager role (3)
     let raw_type = &data.r#type.into_string();
-    // MembershipType::from_str will convert custom (4) to manager (3)
-    let Some(new_type) = MembershipType::from_str(raw_type) else {
+    let Some(requested_type) = MembershipType::from_str(raw_type) else {
         err!("Invalid type")
     };
+
+    let Some(mut member_to_edit) = Membership::find_by_uuid_and_org(&member_id, &org_id, &conn).await else {
+        err!("The specified user isn't member of the organization")
+    };
+    let new_type = MembershipType::requested(requested_type, Some(&member_to_edit), custom_roles_enabled());
 
     // HACK: This converts the Custom role which has the `Manage all collections` box checked into an access_all flag
     // Since the parent checkbox is not sent to the server we need to check and verify the child checkboxes
     // If the box is not checked, the user will still be a manager, but not with the access_all permission
     let access_all = new_type >= MembershipType::Admin
-        || (raw_type.eq("4")
+        || (new_type == MembershipType::Manager
+            && raw_type.eq("4")
             && data.permissions.get("editAnyCollection") == Some(&json!(true))
             && data.permissions.get("deleteAnyCollection") == Some(&json!(true))
             && data.permissions.get("createNewCollections") == Some(&json!(true)));
 
-    let Some(mut member_to_edit) = Membership::find_by_uuid_and_org(&member_id, &org_id, &conn).await else {
-        err!("The specified user isn't member of the organization")
+    // While Custom roles are disabled, a Custom member keeps their stored permissions untouched
+    let custom_permissions = if new_type == MembershipType::Custom && custom_roles_enabled() {
+        Some(CustomPermission::requested(&data.permissions)?)
+    } else {
+        None
     };
 
     if new_type != member_to_edit.atype
@@ -1537,8 +1606,11 @@ async fn edit_member(
         }
     }
 
+    member_to_edit.set_type(new_type);
     member_to_edit.access_all = access_all;
-    member_to_edit.atype = new_type as i32;
+    if let Some(permissions) = &custom_permissions {
+        member_to_edit.set_custom_permissions(permissions);
+    }
 
     // This check is also done at accept_invite, _confirm_invite, _activate_member, edit_member, admin::update_membership_type
     // We need to perform the check after changing the type since `admin` is exempt.
@@ -1610,7 +1682,10 @@ async fn bulk_delete_member(
     for member_id in data.ids {
         let err_msg = match delete_member_impl(&org_id, &member_id, &headers, &conn, &nt).await {
             Ok(()) => String::new(),
-            Err(e) => format!("{e:?}"),
+            Err(e) => {
+                warn!("Unable to delete member {}: {e:?}", member_id.escape_debug());
+                e.message().to_owned()
+            }
         };
 
         bulk_response.push(json!(
@@ -1831,7 +1906,7 @@ async fn post_org_import(
         cipher_data.folder_id = None;
         // Replace the client-provided, unvalidated organizationId with the real target org
         cipher_data.organization_id = Some(org_id.clone());
-        let mut cipher = Cipher::new(cipher_data.r#type, cipher_data.name.clone());
+        let mut cipher = Cipher::new(cipher_data.r#type);
         update_cipher_from_data(
             &mut cipher,
             cipher_data,
@@ -1840,6 +1915,7 @@ async fn post_org_import(
             &conn,
             &nt,
             UpdateType::None,
+            true,
         )
         .await
         .ok();
@@ -1873,29 +1949,37 @@ struct BulkCollectionsData {
 async fn post_bulk_collections(data: Json<BulkCollectionsData>, headers: Headers, conn: DbConn) -> EmptyResult {
     let data: BulkCollectionsData = data.into_inner();
 
-    if Membership::find_confirmed_by_user_and_org(&headers.user.uuid, &data.organization_id, &conn).await.is_none() {
+    let Some(member) =
+        Membership::find_confirmed_by_user_and_org(&headers.user.uuid, &data.organization_id, &conn).await
+    else {
         err!("You need to be a Member of the Organization to call this endpoint")
-    }
+    };
+    // A member who may edit any collection may use every collection of the organization
+    let can_edit_any_collection = member.can_edit_any_collection();
 
     // Get all the collection available to the user in one query
     // Also filter based upon the provided collections
-    let user_collections: HashMap<CollectionId, Collection> =
-        Collection::find_by_organization_and_user_uuid(&data.organization_id, &headers.user.uuid, &conn)
-            .await
-            .into_iter()
-            .filter_map(|c| {
-                if data.collection_ids.contains(&c.uuid) {
-                    Some((c.uuid.clone(), c))
-                } else {
-                    None
-                }
-            })
-            .collect();
+    let collections = if can_edit_any_collection {
+        Collection::find_by_organization(&data.organization_id, &conn).await
+    } else {
+        Collection::find_by_organization_and_user_uuid(&data.organization_id, &headers.user.uuid, &conn).await
+    };
+    let user_collections: HashMap<CollectionId, Collection> = collections
+        .into_iter()
+        .filter_map(|c| {
+            if data.collection_ids.contains(&c.uuid) {
+                Some((c.uuid.clone(), c))
+            } else {
+                None
+            }
+        })
+        .collect();
 
     // Verify if all the collections requested exists and are writable for the user, else abort
     for collection_uuid in &data.collection_ids {
         match user_collections.get(collection_uuid) {
-            Some(collection) if collection.is_writable_by_user(&headers.user.uuid, &conn).await => (),
+            Some(collection)
+                if can_edit_any_collection || collection.is_writable_by_user(&headers.user.uuid, &conn).await => {}
             _ => err_code!("Resource not found", "User does not have access to a collection", 404),
         }
     }
@@ -1904,7 +1988,7 @@ async fn post_bulk_collections(data: Json<BulkCollectionsData>, headers: Headers
         // Only act on existing cipher uuid's
         // Do not abort the operation just ignore it, it could be a cipher was just deleted for example
         if let Some(cipher) = Cipher::find_by_uuid_and_org(cipher_id, &data.organization_id, &conn).await
-            && cipher.is_write_accessible_to_user(&headers.user.uuid, &conn).await
+            && cipher.is_write_accessible_to_user(&headers.user.uuid, CipherAccessScope::OrganizationAdmin, &conn).await
         {
             // When selecting a specific collection from the left filter list, and use the bulk option, you can remove an item from that collection
             // In these cases the client will call this endpoint twice, once for adding the new collections and a second for deleting.
@@ -2039,6 +2123,29 @@ async fn put_policy(
         err!("Invalid or unsupported policy type")
     };
 
+    let current_policy = OrgPolicy::find_by_org_and_type(&org_id, pol_type_enum, &conn).await;
+    let is_currently_enabled = current_policy.as_ref().is_some_and(|policy| policy.enabled);
+
+    // Fill Assist depends on Single Organization. Match Bitwarden's dependency checks by only checking when the
+    // policy changes state.
+    if pol_type_enum == OrgPolicyType::FillAssist && data.enabled && !is_currently_enabled {
+        let single_org_policy_enabled =
+            OrgPolicy::find_by_org_and_type(&org_id, OrgPolicyType::SingleOrg, &conn).await.is_some_and(|p| p.enabled);
+
+        if !single_org_policy_enabled {
+            err!("Turn on the Single organization policy because it is required for the Activate fill assist policy.")
+        }
+    }
+
+    if pol_type_enum == OrgPolicyType::SingleOrg && !data.enabled && is_currently_enabled {
+        let fill_assist_policy_enabled =
+            OrgPolicy::find_by_org_and_type(&org_id, OrgPolicyType::FillAssist, &conn).await.is_some_and(|p| p.enabled);
+
+        if fill_assist_policy_enabled {
+            err!("Turn off the Activate fill assist policy because it requires the Single organization policy.")
+        }
+    }
+
     // Bitwarden only allows the Reset Password policy when Single Org policy is enabled
     // Vaultwarden encouraged to use multiple orgs instead of groups because groups were not available in the past
     // Now that groups are available we can enforce this option when wanted.
@@ -2067,6 +2174,37 @@ async fn put_policy(
 
             if reset_pw_policy_enabled {
                 err!("Account recovery policy is enabled. It is not allowed to disable this policy.")
+            }
+        }
+    }
+
+    if pol_type_enum == OrgPolicyType::FillAssist {
+        let fill_assist_data = match data.data.as_ref() {
+            None | Some(Value::Null) => FillAssistPolicyData {
+                rules_url: None,
+            },
+            Some(data) => {
+                let Ok(data) = serde_json::from_value::<FillAssistPolicyData>(data.clone()) else {
+                    err!("Invalid data for FillAssist policy: rulesUrl has an invalid value.")
+                };
+                data
+            }
+        };
+
+        if data.enabled {
+            let Some(rules_url) = fill_assist_data.rules_url.filter(|url| !url.trim().is_empty()) else {
+                err!("The RulesUrl field is required.")
+            };
+            let Ok(rules_url) = url::Url::parse(&rules_url) else {
+                err!("The RulesUrl field is not a valid fully-qualified http, https, or ftp URL.")
+            };
+
+            if !rules_url.has_host() || !matches!(rules_url.scheme(), "http" | "https" | "ftp") {
+                err!("The RulesUrl field is not a valid fully-qualified http, https, or ftp URL.")
+            }
+
+            if rules_url.scheme() != "https" {
+                err!("RulesUrl must use HTTPS.")
             }
         }
     }
@@ -2102,7 +2240,7 @@ async fn put_policy(
                 }
 
                 log_event(
-                    EventType::OrganizationUserRemoved,
+                    EventType::OrganizationUserRevokedSingleOrganizationNonCompliance,
                     &member.uuid,
                     &org_id,
                     &headers.user.uuid,
@@ -2118,7 +2256,7 @@ async fn put_policy(
         }
     }
 
-    let mut policy = match OrgPolicy::find_by_org_and_type(&org_id, pol_type_enum, &conn).await {
+    let mut policy = match current_policy {
         Some(p) => p,
         None => OrgPolicy::new(org_id.clone(), pol_type_enum, false, "{}".to_owned()),
     };
@@ -2222,7 +2360,10 @@ async fn bulk_revoke_members(
             for member_id in members {
                 let err_msg = match revoke_member_impl(&org_id, &member_id, &headers, &conn).await {
                     Ok(()) => String::new(),
-                    Err(e) => format!("{e:?}"),
+                    Err(e) => {
+                        warn!("Unable to revoke member {}: {e:?}", member_id.escape_debug());
+                        e.message().to_owned()
+                    }
                 };
 
                 bulk_response.push(json!(
@@ -2325,7 +2466,10 @@ async fn bulk_restore_members(
     for member_id in data.ids {
         let err_msg = match restore_member_impl(&org_id, &member_id, &headers, &conn).await {
             Ok(()) => String::new(),
-            Err(e) => format!("{e:?}"),
+            Err(e) => {
+                warn!("Unable to restore member {}: {e:?}", member_id.escape_debug());
+                e.message().to_owned()
+            }
         };
 
         bulk_response.push(json!(
@@ -2478,13 +2622,16 @@ impl GroupRequest {
         let org_collections = Collection::find_by_organization(org_id, conn).await;
         let org_collection_ids: HashSet<&CollectionId> = org_collections.iter().map(|c| &c.uuid).collect();
         if let Some(e) = self.collections.iter().find(|c| !org_collection_ids.contains(&c.id)) {
-            err!("Invalid collection", format!("Collection {} does not belong to organization {}!", e.id, org_id))
+            err!(
+                "Invalid collection",
+                format!("Collection {} does not belong to organization {}!", e.id.escape_debug(), org_id)
+            )
         }
 
         let org_memberships = Membership::find_by_org(org_id, conn).await;
         let org_membership_ids: HashSet<&MembershipId> = org_memberships.iter().map(|m| &m.uuid).collect();
         if let Some(e) = self.users.iter().find(|m| !org_membership_ids.contains(m)) {
-            err!("Invalid member", format!("Member {} does not belong to organization {}!", e, org_id))
+            err!("Invalid member", format!("Member {} does not belong to organization {}!", e.escape_debug(), org_id))
         }
 
         Ok(())
@@ -2771,8 +2918,26 @@ struct OrganizationUserRecoverAccountRequest {
 // But the clients do not seem to use this at all
 // Just add it here in case they will
 #[get("/organizations/<org_id>/public-key")]
-async fn get_organization_public_key(org_id: OrganizationId, headers: OrgMemberHeaders, conn: DbConn) -> JsonResult {
-    if org_id != headers.membership.org_uuid {
+async fn get_organization_public_key(
+    org_id: OrganizationId,
+    headers: Headers,
+    member: Result<OrgMemberHeaders, &'static str>,
+    conn: DbConn,
+) -> JsonResult {
+    // SSO users without an org get the fake one, whose key the v2 JIT password flow fetches anyway
+    if org_id.eq_ignore_ascii_case(FAKE_SSO_IDENTIFIER) && headers.user.private_key.is_none() {
+        return Ok(Json(json!({
+            "object": "organizationPublicKey",
+            "publicKey": fake_sso_org_public_key().await?,
+        })));
+    }
+    let member = match member {
+        Ok(member) => member,
+        // The guard already logged it
+        Err(e) => return Err(crate::error::Error::new_msg(e).with_code(Status::Unauthorized.code)),
+    };
+
+    if org_id != member.membership.org_uuid {
         err!("Organization not found", "Organization id's do not match");
     }
     let Some(org) = Organization::find_by_uuid(&org_id, &conn).await else {
@@ -2785,11 +2950,30 @@ async fn get_organization_public_key(org_id: OrganizationId, headers: OrgMemberH
     })))
 }
 
+/// The SDK only uses this key to wrap an account recovery key that it never sends for the fake org,
+/// so it is made once and its private half dropped.
+async fn fake_sso_org_public_key() -> ApiResult<String> {
+    static PUBLIC_KEY: std::sync::LazyLock<Option<String>> = std::sync::LazyLock::new(|| {
+        let der = openssl::rsa::Rsa::generate(2048).and_then(|rsa| rsa.public_key_to_der()).ok()?;
+        Some(data_encoding::BASE64.encode(&der))
+    });
+
+    let Ok(Some(public_key)) = tokio::task::spawn_blocking(|| PUBLIC_KEY.clone()).await else {
+        err!("Failed to generate the organization key")
+    };
+    Ok(public_key)
+}
+
 // Obsolete - Renamed to public-key (2023.8), left for backwards compatibility with older clients
 // https://github.com/bitwarden/server/blob/9ebe16587175b1c0e9208f84397bb75d0d595510/src/Api/AdminConsole/Controllers/OrganizationsController.cs#L487-L492
 #[get("/organizations/<org_id>/keys")]
-async fn get_organization_keys(org_id: OrganizationId, headers: OrgMemberHeaders, conn: DbConn) -> JsonResult {
-    get_organization_public_key(org_id, headers, conn).await
+async fn get_organization_keys(
+    org_id: OrganizationId,
+    headers: Headers,
+    member: Result<OrgMemberHeaders, &'static str>,
+    conn: DbConn,
+) -> JsonResult {
+    get_organization_public_key(org_id, headers, member, conn).await
 }
 
 // Will allow to reset 2FA too
@@ -2838,12 +3022,11 @@ async fn recover_account(
         err!("Organization user must be confirmed for password reset functionality");
     }
 
-    let fallback_2fa_email =
-        if req.reset_two_factor && CONFIG.mail_enabled() && CONFIG.email_2fa_auto_fallback() && user.verified() {
-            TwoFactor::find_by_user_and_type(&user.uuid, TwoFactorType::Email, &conn).await.is_none()
-        } else {
-            false
-        };
+    let fallback_2fa_email = req.reset_two_factor
+        && CONFIG.mail_enabled()
+        && CONFIG.email_2fa_auto_fallback()
+        && user.verified()
+        && TwoFactor::find_by_user_and_type(&user.uuid, TwoFactorType::Email, &conn).await.is_none();
 
     // Check the new password before the email below, so that a rejected request doesn't tell the user
     // their password was reset

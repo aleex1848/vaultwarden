@@ -34,7 +34,7 @@ use crate::{
         models::{
             AttachmentId, CipherId, Collection, CollectionId, Device, DeviceId, DeviceType, EmergencyAccessId,
             EventType, Membership, MembershipId, MembershipStatus, MembershipType, OrgApiKeyId, OrganizationId,
-            SendFileId, SendId, User, UserId, UserStampException,
+            SendFileId, SendId, User, UserId,
         },
     },
     error::Error,
@@ -314,6 +314,17 @@ impl LoginJwtClaims {
     }
 }
 
+fn calculate_invite_expire_hours(now: &DateTime<Utc>) -> Result<DateTime<Utc>, Error> {
+    let expire_hours = i64::from(CONFIG.invitation_expiration_hours());
+    let Some(hours_delta) = TimeDelta::try_hours(expire_hours) else {
+        err!("Unable to calculate time delta for invite expire hours. Check `INVITATION_EXPIRATION_HOURS`.");
+    };
+    let Some(exp) = now.checked_add_signed(hours_delta) else {
+        err!("Unable to calculate invitation expire date. Check `INVITATION_EXPIRATION_HOURS`.");
+    };
+    Ok(exp)
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct InviteJwtClaims {
     // Not before
@@ -337,19 +348,19 @@ pub fn generate_invite_claims(
     org_id: OrganizationId,
     member_id: MembershipId,
     invited_by_email: Option<String>,
-) -> InviteJwtClaims {
+) -> Result<InviteJwtClaims, Error> {
     let time_now = Utc::now();
-    let expire_hours = i64::from(CONFIG.invitation_expiration_hours());
-    InviteJwtClaims {
+    let exp = calculate_invite_expire_hours(&time_now)?;
+    Ok(InviteJwtClaims {
         nbf: time_now.timestamp(),
-        exp: (time_now + TimeDelta::try_hours(expire_hours).unwrap()).timestamp(),
+        exp: exp.timestamp(),
         iss: JWT_INVITE_ISSUER.to_string(),
         sub: user_id,
         email,
         org_id,
         member_id,
         invited_by_email,
-    }
+    })
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -375,19 +386,19 @@ pub fn generate_emergency_access_invite_claims(
     emer_id: EmergencyAccessId,
     grantor_name: String,
     grantor_email: String,
-) -> EmergencyAccessInviteJwtClaims {
+) -> Result<EmergencyAccessInviteJwtClaims, Error> {
     let time_now = Utc::now();
-    let expire_hours = i64::from(CONFIG.invitation_expiration_hours());
-    EmergencyAccessInviteJwtClaims {
+    let exp = calculate_invite_expire_hours(&time_now)?;
+    Ok(EmergencyAccessInviteJwtClaims {
         nbf: time_now.timestamp(),
-        exp: (time_now + TimeDelta::try_hours(expire_hours).unwrap()).timestamp(),
+        exp: exp.timestamp(),
         iss: JWT_EMERGENCY_ACCESS_INVITE_ISSUER.to_string(),
         sub: user_id,
         email,
         emer_id,
         grantor_name,
         grantor_email,
-    }
+    })
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -492,11 +503,15 @@ pub fn generate_2fa_remember_claims(device_uuid: DeviceId, user_uuid: UserId) ->
     let time_now = Utc::now();
     TwoFactorRememberClaims {
         nbf: time_now.timestamp(),
-        exp: (time_now + TimeDelta::try_days(30).unwrap()).timestamp(),
+        exp: two_factor_remember_expiration(time_now, CONFIG.two_factor_remember_days()),
         iss: JWT_2FA_REMEMBER_ISSUER.to_string(),
         sub: device_uuid,
         user_uuid,
     }
+}
+
+fn two_factor_remember_expiration(time_now: DateTime<Utc>, remember_days: i64) -> i64 {
+    (time_now + TimeDelta::try_days(remember_days).expect("TWO_FACTOR_REMEMBER_DAYS is validated")).timestamp()
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -521,36 +536,43 @@ impl BasicJwtClaims {
     }
 }
 
-pub fn generate_delete_claims(uuid: String) -> BasicJwtClaims {
+pub fn generate_delete_claims(uuid: String) -> Result<BasicJwtClaims, Error> {
     let time_now = Utc::now();
-    let expire_hours = i64::from(CONFIG.invitation_expiration_hours());
-    BasicJwtClaims {
+    let exp = calculate_invite_expire_hours(&time_now)?;
+    Ok(BasicJwtClaims {
         nbf: time_now.timestamp(),
-        exp: (time_now + TimeDelta::try_hours(expire_hours).unwrap()).timestamp(),
+        exp: exp.timestamp(),
         iss: JWT_DELETE_ISSUER.to_string(),
         sub: uuid,
-    }
+    })
 }
 
-pub fn generate_verify_email_claims(user_id: &UserId) -> BasicJwtClaims {
+pub fn generate_verify_email_claims(user_id: &UserId) -> Result<BasicJwtClaims, Error> {
     let time_now = Utc::now();
-    let expire_hours = i64::from(CONFIG.invitation_expiration_hours());
-    BasicJwtClaims {
+    let exp = calculate_invite_expire_hours(&time_now)?;
+    Ok(BasicJwtClaims {
         nbf: time_now.timestamp(),
-        exp: (time_now + TimeDelta::try_hours(expire_hours).unwrap()).timestamp(),
+        exp: exp.timestamp(),
         iss: JWT_VERIFYEMAIL_ISSUER.to_string(),
         sub: user_id.to_string(),
-    }
+    })
 }
 
-pub fn generate_admin_claims() -> BasicJwtClaims {
+pub fn generate_admin_claims() -> Result<BasicJwtClaims, Error> {
     let time_now = Utc::now();
-    BasicJwtClaims {
+    let lifetime_minutes = i64::from(CONFIG.admin_session_lifetime());
+    let Some(minutes_delta) = TimeDelta::try_minutes(lifetime_minutes) else {
+        err!("Unable to calculate time delta for admin session lifetime. Check `ADMIN_SESSION_LIFETIME`.");
+    };
+    let Some(exp) = time_now.checked_add_signed(minutes_delta) else {
+        err!("Unable to calculate admin session lifetime. Check `ADMIN_SESSION_LIFETIME`.");
+    };
+    Ok(BasicJwtClaims {
         nbf: time_now.timestamp(),
-        exp: (time_now + TimeDelta::try_minutes(CONFIG.admin_session_lifetime()).unwrap()).timestamp(),
+        exp: exp.timestamp(),
         iss: JWT_ADMIN_ISSUER.to_string(),
         sub: "admin_panel".to_owned(),
-    }
+    })
 }
 
 pub fn generate_send_claims(send_id: &SendId, file_id: &SendFileId) -> BasicJwtClaims {
@@ -610,6 +632,9 @@ impl<'r> FromRequest<'r> for Host {
 pub struct ClientHeaders {
     pub device_type: i32,
     pub ip: ClientIp,
+    /// `Bitwarden-Client-Version`, `None` when missing or not a version. Unlike the [`ClientVersion`] guard, this
+    /// doesn't log an error, as not every client sends it.
+    pub client_version: Option<semver::Version>,
 }
 
 #[rocket::async_trait]
@@ -626,10 +651,13 @@ impl<'r> FromRequest<'r> for ClientHeaders {
             .get_one("device-type")
             .and_then(|d| d.parse().ok())
             .unwrap_or(DeviceType::UnknownBrowser as i32);
+        let client_version =
+            request.headers().get_one("Bitwarden-Client-Version").and_then(|v| semver::Version::parse(v).ok());
 
         Outcome::Success(ClientHeaders {
             device_type,
             ip,
+            client_version,
         })
     }
 }
@@ -685,31 +713,12 @@ impl<'r> FromRequest<'r> for Headers {
         };
 
         if user.security_stamp != claims.sstamp {
-            if let Some(stamp_exception) =
-                user.stamp_exception.as_deref().and_then(|s| serde_json::from_str::<UserStampException>(s).ok())
-            {
-                let Some(current_route) = request.route().and_then(|r| r.name.as_deref()) else {
-                    err_handler!("Error getting current route for stamp exception")
-                };
+            let Some(current_route) = request.route().and_then(|r| r.name.as_deref()) else {
+                err_handler!("Error getting current route for stamp exception")
+            };
 
-                // Check if the stamp exception has expired first.
-                // Then, check if the current route matches any of the allowed routes.
-                // After that check the stamp in exception matches the one in the claims.
-                if Utc::now().timestamp() > stamp_exception.expire {
-                    // If the stamp exception has been expired remove it from the database.
-                    // This prevents checking this stamp exception for new requests.
-                    let mut user = user;
-                    user.reset_stamp_exception();
-                    if let Err(e) = user.save(&conn).await {
-                        error!("Error updating user: {e:#?}");
-                    }
-                    err_handler!("Stamp exception is expired")
-                } else if !stamp_exception.routes.contains(&current_route.to_owned()) {
-                    err_handler!("Invalid security stamp: Current route and exception route do not match")
-                } else if stamp_exception.security_stamp != claims.sstamp {
-                    err_handler!("Invalid security stamp for matched stamp exception")
-                }
-            } else {
+            // Expired exceptions are only dropped on reset; writing them back here could undo a newer reset
+            if !user.stamp_exceptions().iter().any(|e| e.allows(&claims.sstamp, current_route)) {
                 err_handler!("Invalid security stamp")
             }
         }
