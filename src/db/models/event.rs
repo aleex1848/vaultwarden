@@ -79,6 +79,7 @@ pub enum EventType {
     CipherSoftDeleted = 1115,
     CipherRestored = 1116,
     CipherClientToggledCardNumberVisible = 1117,
+    CipherClientHttpAuthReleased = 1133,
 
     // Collection
     CollectionCreated = 1300,
@@ -111,8 +112,8 @@ pub enum EventType {
     // OrganizationUserAutomaticallyConfirmed = 1517,
     // OrganizationUserSelfRevoked = 1518, // User self-revoked due to declining organization data ownership policy
     OrganizationUserAdminResetTwoFactor = 1519,
-    // OrganizationUserRevoked_TwoFactorNonCompliance = 1520,
-    // OrganizationUserRevoked_SingleOrganizationNonCompliance = 1521,
+    OrganizationUserRevokedTwoFactorNonCompliance = 1520,
+    OrganizationUserRevokedSingleOrganizationNonCompliance = 1521,
     OrganizationUserNotificationBannerActionClicked = 1522,
 
     // Organization
@@ -330,6 +331,7 @@ impl Event {
 
     pub async fn find_by_cipher_uuid(
         cipher_uuid: &CipherId,
+        org_uuid: &OrganizationId,
         start: &NaiveDateTime,
         end: &NaiveDateTime,
         conn: &DbConn,
@@ -337,6 +339,7 @@ impl Event {
         conn.run(move |conn| {
             event::table
                 .filter(event::cipher_uuid.eq(cipher_uuid))
+                .filter(event::org_uuid.eq(org_uuid))
                 .filter(event::event_date.between(start, end))
                 .order_by(event::event_date.desc())
                 .limit(Self::PAGE_SIZE)
@@ -347,17 +350,23 @@ impl Event {
     }
 
     pub async fn clean_events(conn: &DbConn) -> EmptyResult {
-        if let Some(days_to_retain) = CONFIG.events_days_retain() {
-            let dt = Utc::now().naive_utc() - TimeDelta::try_days(days_to_retain).unwrap();
-            conn.run(move |conn| {
-                diesel::delete(event::table.filter(event::event_date.lt(dt)))
-                    .execute(conn)
-                    .map_res("Error cleaning old events")
-            })
-            .await
-        } else {
-            Ok(())
-        }
+        let Some(days_to_retain) = CONFIG.events_days_retain().filter(|&d| d != 0) else {
+            return Ok(());
+        };
+
+        let Some(days_to_retain) = TimeDelta::try_days(i64::from(days_to_retain)) else {
+            err!("Unable to calculate the event retention date, check 'EVENTS_DAYS_RETAIN'")
+        };
+
+        let Some(dt) = Utc::now().naive_utc().checked_sub_signed(days_to_retain) else {
+            err!("Unable to calculate the event retention date, check 'EVENTS_DAYS_RETAIN'")
+        };
+        conn.run(move |conn| {
+            diesel::delete(event::table.filter(event::event_date.lt(dt)))
+                .execute(conn)
+                .map_res("Error cleaning old events")
+        })
+        .await
     }
 }
 

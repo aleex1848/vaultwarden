@@ -53,6 +53,8 @@ pub enum OrgPolicyType {
     // AutoConfirm = 18, // Not supported (not implemented yet)
     // BlockClaimedDomainAccountCreation = 19, // Not supported (Not AGPLv3 Licensed)
     OrganizationUserNotification = 20,
+    // SendControls = 21, // Not supported yet
+    FillAssist = 22,
 }
 
 // https://github.com/bitwarden/server/blob/9ebe16587175b1c0e9208f84397bb75d0d595510/src/Core/AdminConsole/Models/Data/Organizations/Policies/SendOptionsPolicyData.cs#L5
@@ -69,6 +71,14 @@ pub struct SendOptionsPolicyData {
 pub struct ResetPasswordDataModel {
     #[serde(rename = "autoEnrollEnabled", alias = "AutoEnrollEnabled")]
     pub auto_enroll_enabled: bool,
+}
+
+// https://github.com/bitwarden/server/blob/13bc813de8e715a71d3410f1e584e87ccdf76025/src/Core/AdminConsole/Models/Data/Organizations/Policies/FillAssistPolicyData.cs
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FillAssistPolicyData {
+    #[serde(alias = "RulesUrl")]
+    pub rules_url: Option<String>,
 }
 
 /// Local methods
@@ -332,12 +342,20 @@ impl OrgPolicy {
 
             if let Some(p) = Self::find_by_org_and_type(&m.org_uuid, OrgPolicyType::SingleOrg, conn).await
                 && p.enabled
-                && Membership::count_accepted_and_confirmed_by_user(&m.user_uuid, &m.org_uuid, conn).await > 0
             {
-                err!(format!(
-                    "Cannot {} because the organization policy forbids being part of other organization (membership {})",
-                    action, m.uuid
-                ));
+                // Joining, confirming and restoring count memberships revoked elsewhere too, as in Bitwarden. Bitwarden
+                // does not check a modification at all, so that keeps counting only the active ones.
+                let other_memberships = if action == "modify" {
+                    Membership::count_accepted_and_confirmed_by_user(&m.user_uuid, &m.org_uuid, conn).await
+                } else {
+                    Membership::count_accepted_confirmed_or_revoked_by_user(&m.user_uuid, &m.org_uuid, conn).await
+                };
+                if other_memberships > 0 {
+                    err!(format!(
+                        "Cannot {} because the organization policy forbids being part of other organization (membership {})",
+                        action, m.uuid
+                    ));
+                }
             }
         }
 
