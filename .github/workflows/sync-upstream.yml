@@ -53,6 +53,9 @@ jobs:
         with:
           ref: ${{ (inputs.mode || 'sync') == 'fix-ci' && 'sync/upstream-public-api' || 'feature-public-api' }}
           fetch-depth: 0
+          # PAT (repo + workflow scope) so the sync branch push may update
+          # .github/workflows/* and triggers CI checks on the sync PR.
+          token: ${{ secrets.SYNC_GITHUB_TOKEN || github.token }}
           persist-credentials: true
 
       - name: Install Cursor CLI
@@ -165,15 +168,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          # GITHUB_TOKEN cannot push commits that modify .github/workflows/*.
-          git checkout "origin/${FEATURE_BRANCH}" -- .github/workflows/ 2>/dev/null \
-            || git checkout "origin/${SYNC_BRANCH}" -- .github/workflows/
-          if ! git diff --cached --quiet -- .github/workflows/; then
-            git -c user.name="github-actions[bot]" \
-                -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
-                commit -m "chore(sync): retain fork GitHub Actions workflows" || true
-          fi
-
           git push --force origin "HEAD:${SYNC_BRANCH}"
 
           # Give GitHub a moment to register the force-pushed head ref.
@@ -202,7 +196,6 @@ jobs:
           - Strategy is **merge** (not rebase) so this PR stays reviewable.
           - Cursor resolves merge conflicts and auto-fixes fmt/clippy/typos before publish.
           - Auto-merge is enabled; GitHub merges when required checks are green.
-          - Fork \`.github/workflows\` are retained on purpose: \`GITHUB_TOKEN\` cannot push workflow file updates.
 
           ## Test plan
 
@@ -236,7 +229,7 @@ jobs:
               echo "pr_number=${PR_NUM}" >> "${GITHUB_OUTPUT}"
             else
               echo "PR create failed: ${PR_URL}"
-              echo "Ensure SYNC_GITHUB_TOKEN is a classic PAT with 'repo' scope."
+              echo "Ensure SYNC_GITHUB_TOKEN is a classic PAT with 'repo' and 'workflow' scope."
               PR_NUM=""
             fi
           fi
