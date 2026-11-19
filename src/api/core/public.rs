@@ -180,7 +180,7 @@ async fn ldap_import(data: Json<OrgImportData>, token: PublicToken, conn: DbConn
 
             for ext_id in &group_data.member_external_ids {
                 if let Some(member) = Membership::find_by_external_id_and_org(ext_id, &org_id, &conn).await {
-                    let mut group_user = GroupUser::new(group_uuid.clone(), member.uuid.clone());
+                    let group_user = GroupUser::new(group_uuid.clone(), member.uuid.clone());
                     group_user.save(&conn).await?;
                 }
             }
@@ -338,7 +338,7 @@ impl<'r> FromRequest<'r> for PublicToken {
             err_handler!("Token not issued for this client");
         }
 
-        Outcome::Success(PublicToken(claims.client_sub))
+        Outcome::Success(Self(claims.client_sub))
     }
 }
 
@@ -379,7 +379,7 @@ async fn public_add_update_group(
     group.save(conn).await?;
 
     for col_selection in collections {
-        let mut collection_group = CollectionGroup::new(
+        let collection_group = CollectionGroup::new(
             col_selection.id.clone(),
             group.uuid.clone(),
             col_selection.read_only,
@@ -390,7 +390,7 @@ async fn public_add_update_group(
     }
 
     for assigned_member in members {
-        let mut user_entry = GroupUser::new(group.uuid.clone(), assigned_member.clone());
+        let user_entry = GroupUser::new(group.uuid.clone(), assigned_member.clone());
         user_entry.save(conn).await?;
     }
 
@@ -579,7 +579,7 @@ async fn public_put_group_members(
 
     let assigned_members = data.into_inner();
     for assigned_member in assigned_members {
-        let mut user_entry = GroupUser::new(group_id.clone(), assigned_member.clone());
+        let user_entry = GroupUser::new(group_id.clone(), assigned_member.clone());
         user_entry.save(&conn).await?;
     }
 
@@ -735,7 +735,7 @@ async fn public_post_members_invite(data: Json<PublicInviteData>, token: PublicT
         }
 
         for group_id in &data.groups {
-            let mut group_entry = GroupUser::new(group_id.clone(), new_member.uuid.clone());
+            let group_entry = GroupUser::new(group_id.clone(), new_member.uuid.clone());
             group_entry.save(&conn).await?;
         }
     }
@@ -799,7 +799,7 @@ async fn public_put_member(
     GroupUser::delete_all_by_member(&member_to_edit.uuid, &conn).await?;
 
     for group_id in data.groups.iter().flatten() {
-        let mut group_entry = GroupUser::new(group_id.clone(), member_to_edit.uuid.clone());
+        let group_entry = GroupUser::new(group_id.clone(), member_to_edit.uuid.clone());
         group_entry.save(&conn).await?;
     }
 
